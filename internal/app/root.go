@@ -168,6 +168,9 @@ func printExecutionError(root *cobra.Command, stdout, stderr io.Writer, err erro
 		_, writeErr := fmt.Fprintln(stderr, raw.RawStderr())
 		return writeErr
 	}
+	if writeIdentityAuthError(stderr, err) {
+		return nil
+	}
 	if wantsJSONErrors(root) {
 		return apperrors.PrintJSON(stderr, err)
 	}
@@ -283,6 +286,7 @@ func NewRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) 
 			if flags.ClientSecret != "" {
 				authpkg.SetClientSecret(flags.ClientSecret)
 			}
+			syncActiveIdentityFromFlags(flags)
 
 			// Configure global slog level based on --debug / --verbose flags.
 			configureLogLevel(flags)

@@ -572,30 +572,34 @@ func resolveRuntimeAuthToken(ctx context.Context, explicitToken string) string {
 	return getCachedRuntimeToken(ctx)
 }
 
-// Cached token state for process lifetime
+// Cached token state for process lifetime (per active identity).
 var (
-	cachedRuntimeToken     string
-	cachedRuntimeTokenOnce sync.Once
+	cachedRuntimeTokenMu sync.Mutex
+	cachedRuntimeTokens  = map[string]string{}
 )
 
-// getCachedRuntimeToken returns a cached access token, loading it only once per process.
-// This avoids repeated Keychain access which takes ~70ms each time.
+// getCachedRuntimeToken returns a cached access token per active identity.
 func getCachedRuntimeToken(ctx context.Context) string {
-	cachedRuntimeTokenOnce.Do(func() {
-		loadStart := time.Now()
-		defer func() { RecordTiming(ctx, "auth_keychain", time.Since(loadStart)) }()
+	identity := authpkg.ResolveActiveIdentity()
+	cachedRuntimeTokenMu.Lock()
+	defer cachedRuntimeTokenMu.Unlock()
+	if token, ok := cachedRuntimeTokens[identity]; ok {
+		return token
+	}
 
-		configDir := defaultConfigDir()
-		token, tokenErr := resolveAccessTokenFromDir(ctx, configDir)
-		if tokenErr != nil && errors.Is(tokenErr, authpkg.ErrTokenDecryption) {
-			slog.Error(tokenErr.Error())
-			return
-		}
-		if token != "" {
-			cachedRuntimeToken = token
-		}
-	})
-	return cachedRuntimeToken
+	loadStart := time.Now()
+	defer func() { RecordTiming(ctx, "auth_keychain", time.Since(loadStart)) }()
+
+	configDir := resolvedConfigDir()
+	token, tokenErr := resolveAccessTokenFromDir(ctx, configDir)
+	if tokenErr != nil && errors.Is(tokenErr, authpkg.ErrTokenDecryption) {
+		slog.Error(tokenErr.Error())
+		return ""
+	}
+	if token != "" {
+		cachedRuntimeTokens[identity] = token
+	}
+	return cachedRuntimeTokens[identity]
 }
 
 // generateExecutionID returns a random 16-char hex string used to correlate
@@ -607,11 +611,12 @@ func generateExecutionID() string {
 	return hex.EncodeToString(b)
 }
 
-// ResetRuntimeTokenCache clears the cached token, forcing a reload on next access.
+// ResetRuntimeTokenCache clears cached tokens, forcing reload on next access.
 // This should be called after login/logout operations.
 func ResetRuntimeTokenCache() {
-	cachedRuntimeTokenOnce = sync.Once{}
-	cachedRuntimeToken = ""
+	cachedRuntimeTokenMu.Lock()
+	defer cachedRuntimeTokenMu.Unlock()
+	cachedRuntimeTokens = map[string]string{}
 }
 
 func newRuntimeContentScanner() safety.Scanner {

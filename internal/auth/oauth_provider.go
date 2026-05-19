@@ -497,7 +497,7 @@ continueLogin:
 
 	// Save token data with associated client ID for refresh
 	tokenData.ClientID = p.clientID
-	if err := SaveTokenData(p.configDir, tokenData); err != nil {
+	if err := LoginPersistToken(ctx, p.configDir, ResolveActiveIdentity(), tokenData); err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.T("保存 token 失败"), err)
 	}
 

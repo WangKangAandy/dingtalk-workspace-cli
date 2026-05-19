@@ -16,6 +16,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -91,7 +92,8 @@ func newAuthLoginCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			configDir := defaultConfigDir()
+			configDir := resolvedConfigDir()
+			expectedIdentity := authpkg.ResolveActiveIdentity()
 			var tokenData *authpkg.TokenData
 
 			switch {
@@ -100,8 +102,8 @@ func newAuthLoginCommand() *cobra.Command {
 					AccessToken: cfg.Token,
 					ExpiresAt:   time.Now().Add(config.ManualTokenExpiry),
 				}
-				if err := authpkg.SaveTokenData(configDir, tokenData); err != nil {
-					return apperrors.NewInternal(fmt.Sprintf("failed to persist auth token: %v", err))
+				if err := authpkg.LoginPersistToken(cmd.Context(), configDir, expectedIdentity, tokenData); err != nil {
+					return authLoginPersistError(cmd, err)
 				}
 			case cfg.Device:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.DeviceFlowTimeout)
@@ -111,7 +113,7 @@ func newAuthLoginCommand() *cobra.Command {
 				provider.Output = cmd.ErrOrStderr()
 				tokenData, err = provider.Login(loginCtx)
 				if err != nil {
-					return apperrors.NewAuth(fmt.Sprintf("device authorization failed: %v", err))
+					return authLoginFlowError(cmd, err)
 				}
 			default:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.OAuthFlowTimeout)
@@ -122,7 +124,7 @@ func newAuthLoginCommand() *cobra.Command {
 				configureOAuthProviderCompatibility(provider, configDir)
 				tokenData, err = provider.Login(loginCtx, cfg.Force)
 				if err != nil {
-					return apperrors.NewAuth(fmt.Sprintf("dingtalk login failed: %v", err))
+					return authLoginFlowError(cmd, err)
 				}
 			}
 
@@ -189,7 +191,7 @@ func newAuthLogoutCommand() *cobra.Command {
 		Short:             "清除认证信息",
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			configDir := defaultConfigDir()
+			configDir := resolvedConfigDir()
 			revokeCtx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
 			defer cancel()
 			_ = authpkg.RevokeTokenRemote(revokeCtx)
@@ -235,7 +237,7 @@ func newAuthStatusCommand() *cobra.Command {
 		Short:             "查看认证状态",
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			configDir := defaultConfigDir()
+			configDir := resolvedConfigDir()
 
 			authenticated := false
 			refreshed := false
@@ -539,4 +541,22 @@ func writeAuthLoginJSON(w io.Writer, data *authpkg.TokenData, forced bool) error
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(resp)
+}
+
+func authLoginPersistError(cmd *cobra.Command, err error) error {
+	if writeIdentityAuthError(cmd.ErrOrStderr(), err) {
+		return err
+	}
+	return apperrors.NewInternal(fmt.Sprintf("failed to persist auth token: %v", err))
+}
+
+func authLoginFlowError(cmd *cobra.Command, err error) error {
+	if writeIdentityAuthError(cmd.ErrOrStderr(), err) {
+		return err
+	}
+	var mismatch *authpkg.IdentityMismatchError
+	if stderrors.As(err, &mismatch) {
+		return err
+	}
+	return apperrors.NewAuth(fmt.Sprintf("login failed: %v", err))
 }

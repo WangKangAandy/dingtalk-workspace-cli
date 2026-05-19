@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -26,6 +27,9 @@ import (
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
+
+// ErrIdentityNotAuthenticated indicates an explicit identity has no stored token (fail-closed).
+var ErrIdentityNotAuthenticated = errors.New("identity not authenticated")
 
 // TokenData holds the OAuth token set persisted to disk.
 type TokenData struct {
@@ -105,6 +109,12 @@ func SaveTokenData(configDir string, data *TokenData) error {
 		}
 		return h.SaveToken(configDir, jsonData)
 	}
+	if usesPerIdentityFileStore(configDir) {
+		if err := SaveSecureTokenData(configDir, data); err != nil {
+			return err
+		}
+		return WriteTokenMarker(configDir)
+	}
 	return SaveTokenDataKeychain(data)
 }
 
@@ -122,6 +132,26 @@ func LoadTokenData(configDir string) (*TokenData, error) {
 			return nil, fmt.Errorf("parsing token data from hook: %w", err)
 		}
 		return &td, nil
+	}
+
+	identity := ResolveActiveIdentity()
+	if !IsDefaultIdentity(identity) {
+		configDir = ConfigDirForIdentity(getDefaultConfigDir(), identity)
+		if !SecureDataExists(configDir) {
+			return nil, ErrIdentityNotAuthenticated
+		}
+		data, err := LoadSecureTokenData(configDir)
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+
+	if usesPerIdentityFileStore(configDir) {
+		if !SecureDataExists(configDir) {
+			return nil, ErrIdentityNotAuthenticated
+		}
+		return LoadSecureTokenData(configDir)
 	}
 
 	// Default: keychain with legacy .data migration
@@ -145,12 +175,28 @@ func DeleteTokenData(configDir string) error {
 	if h := edition.Get(); h.DeleteToken != nil {
 		return h.DeleteToken(configDir)
 	}
+	if usesPerIdentityFileStore(configDir) {
+		_ = DeleteTokenMarker(configDir)
+		return DeleteSecureData(configDir)
+	}
 	keychainErr := DeleteTokenDataKeychain()
 	legacyErr := DeleteSecureData(configDir)
 	if keychainErr != nil {
 		return keychainErr
 	}
 	return legacyErr
+}
+
+func usesPerIdentityFileStore(configDir string) bool {
+	return IsPerIdentityConfigDir(getDefaultConfigDir(), configDir)
+}
+
+// LoginPersistToken verifies --sender-id (when set) then saves token data.
+func LoginPersistToken(ctx context.Context, configDir, expectedSenderID string, tokenData *TokenData) error {
+	if err := VerifyLoginIdentity(ctx, expectedSenderID, tokenData); err != nil {
+		return err
+	}
+	return SaveTokenData(configDir, tokenData)
 }
 
 // RevokeTokenRemote calls the appropriate logout/revoke endpoint to invalidate the access token.

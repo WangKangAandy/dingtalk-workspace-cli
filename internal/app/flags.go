@@ -22,6 +22,7 @@ import (
 type GlobalFlags struct {
 	ClientID     string
 	ClientSecret string
+	SenderID     string
 	Debug        bool
 	DryRun       bool
 	Fields       string
@@ -36,6 +37,7 @@ type GlobalFlags struct {
 }
 
 func bindPersistentFlags(cmd *cobra.Command, flags *GlobalFlags) {
+	cmd.PersistentFlags().StringVar(&flags.SenderID, "sender-id", "", i18n.T("钉钉用户身份 ID（多用户 OAuth，与 DWS_AUTH_IDENTITY 等价）"))
 	cmd.PersistentFlags().StringVar(&flags.ClientID, "client-id", "", i18n.T("覆盖 OAuth 客户端 ID (钉钉 AppKey)"))
 	cmd.PersistentFlags().StringVar(&flags.ClientSecret, "client-secret", "", i18n.T("覆盖 OAuth 客户端密钥 (钉钉 AppSecret)"))
 	cmd.PersistentFlags().BoolVar(&flags.Debug, "debug", false, "显示调试日志")

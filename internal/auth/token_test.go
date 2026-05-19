@@ -26,6 +26,8 @@ import (
 func cleanupKeychain(t *testing.T) {
 	t.Helper()
 	t.Setenv(keychain.StorageDirEnv, t.TempDir())
+	// LoadTokenData rewrites configDir when DWS_AUTH_IDENTITY is set; clear so temp dirs work.
+	t.Setenv(EnvAuthIdentity, "")
 	t.Cleanup(func() {
 		_ = keychain.Remove(keychain.Service, keychain.AccountToken)
 	})

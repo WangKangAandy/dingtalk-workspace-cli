@@ -132,12 +132,23 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 
 `dws schema` 输出的 `flag_overlay[key].alias` 就是实际生效的 flag 名（如 `attendeeUserIds → --attendee-user-ids`）；`parameters[key]` 是原始 JSON Schema；`required` 是必填字段数组；`sensitive: true` 表示写/删操作，须先向用户确认再加 `--yes`。
 
+## OpenClaw / 钉钉机器人（多用户 OAuth，MVP）
+
+当 **OpenClaw dingtalk-connector** 通过终端调用本 CLI 时（与本地单独使用 `dws` 均适用）：
+
+- **身份**：子进程会设置 `DWS_AUTH_IDENTITY=<当前聊天用户的 senderId>`（与全局 **`--sender-id <id>`** 等价）。`calendar` / `contact` / `doc` 等业务命令使用该 identity 的 token（`~/.dws/users/<senderId>/`）；**fail-closed**，不会混用部署者 default token。
+- **凭证（dingmbw vs ding6ui）**：用户 OAuth 与业务 API 使用 **dingmbw**，凭证来自本机 **`~/.dws/`**（`app.json` + `.data`），或 OpenClaw 配置 **`channels.dingtalk-connector.dwsApp`**（路径 2）。**Connector 不会**把机器人应用（ding6ui）的 `clientId`/`clientSecret` 注入为 `DWS_CLIENT_*`，以免覆盖 dingmbw、导致 token 与 client 不一致。
+- **未登录 / 过期**：在 connector 场景下，stderr 出现 `IDENTITY_NOT_AUTHENTICATED`、`AUTH_TOKEN_EXPIRED` 等时，**connector 会在当前会话推送 device 授权链接**；引导用户 **本人钉钉扫码** 后重试，无需 SSH 到网关执行 `dws auth login`。
+- **机器人发消息**：`dws chat message send-by-bot` 须按会话 **`[DingTalk Bot Context]`** 使用 **`--client-id <ding6ui AppKey>`**，与业务 dws 分离。
+- **错绑**：他人扫码完成 device 流时，落盘前校验失败会输出 **`IDENTITY_MISMATCH`**；须提示勿转发链接，由本人重新授权。
+
 ## 错误处理
 1. 遇到错误，加 `--verbose` 重试一次
 2. 若 stderr 出现 `RECOVERY_EVENT_ID=<event_id>`，优先按 [recovery-guide.md](./references/recovery-guide.md) 执行 recovery 闭环
 3. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
 4. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
 5. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
+6. **OpenClaw / 多用户**：stderr 一行 JSON 含 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → 由 connector 推链或本地 `dws auth login --sender-id <id> --device`；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
 
 
 ## 详细参考 (按需读取)

@@ -30,6 +30,10 @@ import (
 // the same host compatibility hooks as MCP. It mirrors the former body of
 // getCachedRuntimeToken (excluding process-level cache and timing).
 func resolveAccessTokenFromDir(ctx context.Context, configDir string) (string, error) {
+	if authpkg.IsPerIdentityConfigDir(defaultConfigDir(), configDir) &&
+		!authpkg.SecureDataExists(configDir) {
+		return "", &authpkg.IdentityNotAuthenticatedError{Identity: authpkg.ResolveActiveIdentity()}
+	}
 	disc := slog.New(slog.NewTextHandler(io.Discard, nil))
 	provider := authpkg.NewOAuthProvider(configDir, disc)
 	configureOAuthProviderCompatibility(provider, configDir)
@@ -59,11 +63,11 @@ func ResolveAuxiliaryAccessToken(ctx context.Context, configDir, explicitToken s
 	if strings.TrimSpace(configDir) == "" {
 		return "", fmt.Errorf("config directory is empty")
 	}
-	if filepath.Clean(configDir) == filepath.Clean(defaultConfigDir()) {
+	if filepath.Clean(configDir) == filepath.Clean(resolvedConfigDir()) {
 		if tok := resolveRuntimeAuthToken(ctx, ""); tok != "" {
 			return tok, nil
 		}
-		return "", noCredentialsError()
+		return "", noCredentialsErrorForActiveIdentity()
 	}
 	tok, err := resolveAccessTokenFromDir(ctx, configDir)
 	if err != nil {
@@ -72,7 +76,7 @@ func ResolveAuxiliaryAccessToken(ctx context.Context, configDir, explicitToken s
 	if tok != "" {
 		return tok, nil
 	}
-	return "", noCredentialsError()
+	return "", noCredentialsErrorForActiveIdentity()
 }
 
 func noCredentialsError() error {
