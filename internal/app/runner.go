@@ -352,6 +352,12 @@ func (r *runtimeRunner) executeInvocation(ctx context.Context, endpoint string, 
 	// Fail-fast: reject unauthenticated requests before making network calls.
 	// This provides a clear error message instead of cryptic HTTP 400 from MCP.
 	if strings.TrimSpace(authToken) == "" {
+		if err := noCredentialsErrorForActiveIdentity(); err != nil {
+			var identityErr *authpkg.IdentityNotAuthenticatedError
+			if errors.As(err, &identityErr) {
+				return executor.Result{}, identityErr
+			}
+		}
 		return executor.Result{}, apperrors.NewAuth(
 			"未登录，请先执行 dws auth login",
 			apperrors.WithReason("not_authenticated"),
