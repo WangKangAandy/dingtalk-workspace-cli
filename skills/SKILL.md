@@ -138,7 +138,7 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 
 - **身份**：子进程会设置 `DWS_AUTH_IDENTITY=<当前聊天用户的 senderId>`（与全局 **`--sender-id <id>`** 等价）。`calendar` / `contact` / `doc` 等业务命令使用该 identity 的 token（`~/.dws/users/<senderId>/`）；**fail-closed**，不会混用部署者 default token。
 - **凭证（dingmbw vs ding6ui）**：用户 OAuth 与业务 API 使用 **dingmbw**，凭证来自本机 **`~/.dws/`**（`app.json` + `.data`），或 OpenClaw 配置 **`channels.dingtalk-connector.dwsApp`**（路径 2）。**Connector 不会**把机器人应用（ding6ui）的 `clientId`/`clientSecret` 注入为 `DWS_CLIENT_*`，以免覆盖 dingmbw、导致 token 与 client 不一致。
-- **未登录 / 过期**：在 connector 场景下，stderr 出现 `IDENTITY_NOT_AUTHENTICATED`、`AUTH_TOKEN_EXPIRED` 等时，**connector 会在当前会话推送 device 授权链接**；引导用户 **本人钉钉扫码** 后重试，无需 SSH 到网关执行 `dws auth login`。
+- **未登录 / 过期**：connector **不**代为 login。Agent **唯一标准命令**（裸 `dws auth login` 已废弃）：`dws auth status --sender-id <DWS_AUTH_IDENTITY> --format json` → `dws auth login --sender-id <DWS_AUTH_IDENTITY> --device`，将授权链接回复给用户。细则见 [dws-auth-workflow.md](./references/dws-auth-workflow.md)「命令规范」。
 - **机器人发消息**：`dws chat message send-by-bot` 须按会话 **`[DingTalk Bot Context]`** 使用 **`--client-id <ding6ui AppKey>`**，与业务 dws 分离。
 - **错绑**：他人扫码完成 device 流时，落盘前校验失败会输出 **`IDENTITY_MISMATCH`**；须提示勿转发链接，由本人重新授权。
 
@@ -148,11 +148,13 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 3. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
 4. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
 5. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
-6. **OpenClaw / 多用户**：stderr 一行 JSON 含 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → 由 connector 推链或本地 `dws auth login --sender-id <id> --device`；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
+6. **OpenClaw / 多用户**：`IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → Agent 执行 `dws auth login --sender-id <id> --device` 并将链接发给用户；`DWS_AUTH_DENIAL reason=*` → 按 reason 引导（见 [dws-auth-contract.md](./references/dws-auth-contract.md)）；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
 
 
 ## 详细参考 (按需读取)
 
+- [references/dws-auth-workflow.md](./references/dws-auth-workflow.md) — **OpenClaw 多用户 auth 工作流 + 命令规范（唯一编排源）**
+- [references/dws-auth-contract.md](./references/dws-auth-contract.md) — login exit code、`DWS_AUTH_DENIAL` 契约
 - [references/products/](./references/products/) — 各产品命令详细参考（flag 细节以 `--help` / `dws schema` 为准）
 - [references/intent-guide.md](./references/intent-guide.md) — 意图路由指南（易混淆场景对照）
 - [references/global-reference.md](./references/global-reference.md) — 全局标志、认证、输出格式

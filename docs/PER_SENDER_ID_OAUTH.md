@@ -1,6 +1,7 @@
 # Per-senderId OAuth (P1) — 本地开发说明
 
-对应 OpenClaw roadmap：`~/.openclaw/vendor/dingtalk-openclaw-connector-fix-Community/docs/ROADMAP-per-senderId-oauth.md`
+对应 OpenClaw roadmap：`dingtalk-openclaw-connector-fix-Community/docs/ROADMAP-per-senderId-oauth.md`  
+Agent auth 工作流（唯一编排源）：**本仓库** skill `references/dws-auth-workflow.md`
 
 ## 构建
 
@@ -33,5 +34,5 @@ DWS_AUTH_IDENTITY=userA dws contact user get-self --format json   # 成功（已
 
 ## 后续
 
-- connector P2：`getDwsSpawnEnv` + `onCommandOutput` 自动补链（见 roadmap §2.3）
+- connector：仅 `getDwsSpawnEnv` + `DWS_AUTH_IDENTITY`；login 由 Agent 按 skill `references/dws-auth-workflow.md` 执行
 - 向 `DingTalk-Real-AI/dingtalk-workspace-cli` 提 PR 前请跑全量 `make test`

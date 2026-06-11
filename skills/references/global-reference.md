@@ -2,44 +2,52 @@
 
 ## 认证
 
+> **命令规范 + OpenClaw 工作流全文：** [dws-auth-workflow.md](./dws-auth-workflow.md)（唯一编排源）。  
+> 本节为速查表，不重复工作流步骤。
+
+### 命令速查（合并，按场景）
+
+| 命令 | 适用场景 | 状态 | token 目录 |
+|------|----------|------|------------|
+| `dws auth status --sender-id <id> --format json` | **OpenClaw 钉钉 IM**、多用户 | ✅ **标准** | `~/.dws/users/<id>/` |
+| `dws auth login --sender-id <id> --device` | **OpenClaw 钉钉 IM**、网关无头服务器 | ✅ **标准** | `~/.dws/users/<id>/` |
+| `dws auth login` | 本机开发（有浏览器，loopback） | ⚠️ **仅本机 CLI** | `~/.dws/`（default） |
+| `dws auth login --device`（无 `--sender-id`） | 运维 SSH 一次性初始化 dingmbw；本机无头 | ⚠️ **非 IM 用户授权** | `~/.dws/`（default） |
+| `dws auth status` / `logout` / `reset`（无 `--sender-id`） | 本机单用户 default 身份 | ⚠️ **仅本机 CLI** | `~/.dws/` |
+| 裸 `dws auth login` / 省略 `--sender-id` 的 login/status | OpenClaw **Agent** 处理钉钉聊天 | ❌ **废弃禁止** | — |
+
+**OpenClaw 钉钉 `<id>`：** prompt 中 `[DingTalk DWS Context]` 的 `DWS_AUTH_IDENTITY`。Agent 必须显式写 `--sender-id`，不要只靠 env。
+
+**两套目录并存的原因：** `~/.dws/` 存 default（运维/本机）；`~/.dws/users/<id>/` 存各聊天用户。设了 `DWS_AUTH_IDENTITY` 时 **fail-closed**，不会混用 default token。
+
+**Agent 默认口令（OpenClaw 钉钉）：**
+
 ```bash
-# 首次: OAuth 设备流登录 (钉钉扫码授权)
-dws auth login
-
-# 查看状态
-dws auth status
-
-# 退出
-dws auth logout
-
-# 重置本地凭证 (Token 解密失败时使用)
-dws auth reset
+dws auth status --sender-id <DWS_AUTH_IDENTITY> --format json
+dws auth login --sender-id <DWS_AUTH_IDENTITY> --device
 ```
 
-登录后自动管理 token 刷新，日常使用无需重复登录。
+### Token 生命周期
+
+登录后自动刷新，日常使用无需重复登录。
 
 | Token | 有效期 | 说明 |
 |-------|--------|------|
 | Access Token | 2 小时 | 调用 API 的凭证，过期自动刷新 |
 | Refresh Token | 30 天 | 换新 Access Token，使用后轮转 |
 
-30 天内使用一次即自动续期。
+30 天内使用一次即自动续期。`refresh_token` 单设备独占，远程刷新后源设备凭证失效。
 
-### 认证失败处理
-- 命令返回 `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / "Token验证失败" → 执行 `dws auth login` 重新登录
+### 认证失败
 
-### Headless 环境 (CI/CD)
+| 错误 | 处理 |
+|------|------|
+| `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED`（OpenClaw 钉钉） | `dws auth login --sender-id <DWS_AUTH_IDENTITY> --device` |
+| `DWS_AUTH_DENIAL reason=*` | 按 reason 引导，见 [dws-auth-contract.md](./dws-auth-contract.md) |
+| `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL`（本机 default） | `dws auth login` 或 `dws auth login --device` |
+| HTTP 403 / scope 不足 | 联系管理员开权限，**不要**反复 login |
 
-```bash
-# 通过环境变量配置认证（无需交互式登录）
-export DWS_CLIENT_ID=<your-app-key>
-export DWS_CLIENT_SECRET=<your-app-secret>
-dws auth login
-
-# 或使用 --device 设备流登录（远程服务器/Docker）
-dws auth login --device
-```
-refresh_token 单设备独占，远程刷新后源设备凭证失效。
+**CI/CD：** 可 `export DWS_CLIENT_ID` / `DWS_CLIENT_SECRET` 后 `dws auth login --device`（default 身份）；与 OpenClaw per-sender 授权无关。
 
 ## Recovery
 
