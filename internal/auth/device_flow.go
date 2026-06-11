@@ -245,7 +245,6 @@ func (p *DeviceFlowProvider) loginOnce(ctx context.Context, attempt int) (*Token
 	}
 	denialReason := classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL"))
 	if denialReason != "" {
-		WriteAuthDenialLine(p.output(), denialReason)
 		_, _ = fmt.Fprintln(p.output(), "")
 		switch denialReason {
 		case "user_forbidden":

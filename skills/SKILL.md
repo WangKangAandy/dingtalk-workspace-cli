@@ -148,13 +148,13 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 3. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
 4. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
 5. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
-6. **OpenClaw / 多用户**：`IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → Agent 执行 `dws auth login --sender-id <id> --device` 并将链接发给用户；`DWS_AUTH_DENIAL reason=*` → 按 reason 引导（见 [dws-auth-contract.md](./references/dws-auth-contract.md)）；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
+6. **OpenClaw / 多用户**：`IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → Agent 执行 `dws auth login --sender-id <id> --device` 并将链接发给用户；login **exit 2** 且 stderr 为 CLI 拒绝 → 按 [dws-auth-contract.md](./references/dws-auth-contract.md) 引导；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
 
 
 ## 详细参考 (按需读取)
 
 - [references/dws-auth-workflow.md](./references/dws-auth-workflow.md) — **OpenClaw 多用户 auth 工作流 + 命令规范（唯一编排源）**
-- [references/dws-auth-contract.md](./references/dws-auth-contract.md) — login exit code、`DWS_AUTH_DENIAL` 契约
+- [references/dws-auth-contract.md](./references/dws-auth-contract.md) — login exit code、Step4 stderr 说明
 - [references/products/](./references/products/) — 各产品命令详细参考（flag 细节以 `--help` / `dws schema` 为准）
 - [references/intent-guide.md](./references/intent-guide.md) — 意图路由指南（易混淆场景对照）
 - [references/global-reference.md](./references/global-reference.md) — 全局标志、认证、输出格式

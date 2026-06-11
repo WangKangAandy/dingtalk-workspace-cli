@@ -43,7 +43,7 @@ dws auth login --sender-id <DWS_AUTH_IDENTITY> --device
 | 错误 | 处理 |
 |------|------|
 | `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED`（OpenClaw 钉钉） | `dws auth login --sender-id <DWS_AUTH_IDENTITY> --device` |
-| `DWS_AUTH_DENIAL reason=*` | 按 reason 引导，见 [dws-auth-contract.md](./dws-auth-contract.md) |
+| Step4 CLI 拒绝 / login exit 2 | 读 stderr 中文说明，见 [dws-auth-contract.md](./dws-auth-contract.md) |
 | `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL`（本机 default） | `dws auth login` 或 `dws auth login --device` |
 | HTTP 403 / scope 不足 | 联系管理员开权限，**不要**反复 login |
 

@@ -558,8 +558,5 @@ func authLoginFlowError(cmd *cobra.Command, err error) error {
 	if stderrors.As(err, &mismatch) {
 		return err
 	}
-	if apperrors.IsLoginTimeout(err) {
-		return apperrors.NewLoginTimeout(err)
-	}
 	return apperrors.NewAuth(fmt.Sprintf("login failed: %v", err))
 }

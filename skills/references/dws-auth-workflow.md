@@ -41,7 +41,7 @@ dws auth login --sender-id <DWS_AUTH_IDENTITY> --device
 | 角色 | 职责 |
 |------|------|
 | **dingtalk-connector** | 消息通道；dispatch 时设置 `DWS_AUTH_IDENTITY`；prompt 注入 `[DingTalk DWS Context]`（**不**代为 login） |
-| **dws CLI** | `auth login` / `auth status` / token 落盘；Step4 CLI 校验；输出 `DWS_AUTH_DENIAL reason=*` |
+| **dws CLI** | `auth login` / `auth status` / token 落盘；Step4 CLI 校验；stderr 输出中文拒绝说明 |
 | **Agent** | 按本工作流执行；将授权链接/说明回复给用户 |
 
 ## 固定工作流
@@ -56,8 +56,8 @@ flowchart TD
     F --> G[用户扫码完成]
     G --> H[用户再发一条消息或同轮 status 确认]
     H --> B
-    E --> I{stderr 含 DWS_AUTH_DENIAL?}
-    I -->|user_not_allowed 等| J[按 reason 引导联系管理员]
+    E --> I{login exit 2 且 stderr 为 CLI 拒绝?}
+    I -->|是| J[按 stderr 引导联系管理员]
     J --> K[用户确认已开通]
     K --> E
 ```
@@ -90,18 +90,14 @@ dws auth login --sender-id <senderId> --device
 
 ### 3. CLI 拒绝（Step4）
 
-stderr 契约行示例：
+login 失败且 exit code 为 `2` 时，阅读 stderr 中文说明（token **未落盘**）：
 
-```text
-DWS_AUTH_DENIAL reason=user_not_allowed
-```
-
-| reason | Agent 引导 |
-|--------|-----------|
-| `user_not_allowed` | 联系管理员在「开发者设置」加入 CLI 授权名单 |
-| `cli_not_enabled` | 联系管理员开启组织 CLI |
-| `user_forbidden` | 组织策略禁止，联系管理员 |
-| 其他 | 引用 stderr 原文，勿猜测 |
+| 典型 stderr | Agent 引导 |
+|-------------|-----------|
+| 不在 CLI 授权人员范围 | 联系管理员加入 CLI 授权名单 |
+| 尚未开启 CLI 数据访问权限 | 联系管理员开启组织 CLI |
+| 禁止所有成员使用 CLI | 组织策略禁止，联系管理员 |
+| 其它 | 引用 stderr 原文，勿猜测 |
 
 用户确认已开通后，从步骤 1 重新执行。
 
@@ -127,4 +123,4 @@ token 落盘后再执行 `dws calendar` / `dws doc` 等；命令加 `--format js
 
 ## CLI 契约
 
-login exit code、`DWS_AUTH_DENIAL` 字段说明见 [dws-auth-contract.md](./dws-auth-contract.md)。
+login exit code 与 stderr 说明见 [dws-auth-contract.md](./dws-auth-contract.md)。
