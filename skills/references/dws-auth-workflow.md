@@ -1,7 +1,7 @@
 # DWS Auth 工作流（dws skill 唯一编排源）
 
 > **归属：** dws 仓库 skill（本文件）。connector 与其它 Skill **只引用、不复制**。  
-> **命令规范的唯一说明处：** 下文「命令规范」+ 工作流步骤。
+> **与 [钉钉官方 connector](https://github.com/DingTalk-Real-AI/dingtalk-openclaw-connector) 一致：** **Agent** exec `dws auth`；**差异仅在 per-sender**（`--sender-id` + `~/.dws/users/<id>/`）。
 
 ## 命令规范（统一说明）
 
@@ -84,9 +84,27 @@ dws auth login --sender-id <senderId> --device
 ```
 
 - 从 stdout/stderr 提取 **授权链接** 与 **授权码**，在回复中发给用户
-- login 可能阻塞至扫码完成（最长约 15 分钟）；`exec` 超时可设足够长，或先提取链接回复用户、下条消息再 `status`
+- login 可能阻塞至扫码完成（最长约 15 分钟）；见下文「OpenClaw exec 超时」
 - **禁止** `kill` / `pkill` 正在进行的 login 进程
-- **禁止** 并行对同一 `senderId` 多次 spawn login；若已有进行中 login，等待或复用输出中的链接
+- **禁止** 并行对同一 `senderId` 多次 login；若已有进行中 login，等待或复用输出中的链接
+
+### OpenClaw exec 超时（auth login）
+
+> 勿与 dws CLI 全局标志 `--timeout`（HTTP 请求默认 30s）混淆；此处指 OpenClaw **`exec` 工具的 `timeout` 参数**。
+
+OpenClaw `exec` 的 `ProcessSupervisor` 对子进程有 **overall-timeout**；`yieldMs` / `background` 只把 exec 从前台切到后台 session，**不会取消**该计时器。
+
+| Agent 传参 | 30s 被杀？ | 说明 |
+|------------|-----------|------|
+| **不传** `timeout` | 否 | OpenClaw 默认 **1800s**（30 分钟） |
+| 显式 `timeout: 30` | **是** | 从 spawn 起满 30s → `overall-timeout` → **SIGKILL**（kang 案根因） |
+| `yieldMs` + `timeout: 30` | **是** | 后台 session 仍受同一 30s 限制 |
+
+**推荐做法：**
+
+1. `auth status`：可省略 `timeout` 或短超时（数秒即可）。
+2. `auth login`：**禁止** `timeout: 30`；省略 `timeout`（默认 1800）或显式 `timeout: 900`。
+3. **两阶段（推荐）**：`yieldMs`≈10000，从输出提取授权链接回复用户；login 在后台继续至扫码完成；下条消息再 `auth status` 确认。两阶段下也须满足上条（勿 30s）。
 
 ### 3. CLI 拒绝（Step4）
 

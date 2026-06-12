@@ -10,7 +10,7 @@
 | 命令 | 适用场景 | 状态 | token 目录 |
 |------|----------|------|------------|
 | `dws auth status --sender-id <id> --format json` | **OpenClaw 钉钉 IM**、多用户 | ✅ **标准** | `~/.dws/users/<id>/` |
-| `dws auth login --sender-id <id> --device` | **OpenClaw 钉钉 IM**、网关无头服务器 | ✅ **标准** | `~/.dws/users/<id>/` |
+| `dws auth login --sender-id <id> --device` | **OpenClaw 钉钉 IM**、多用户 | ✅ **标准（Agent exec）** | `~/.dws/users/<id>/` |
 | `dws auth login` | 本机开发（有浏览器，loopback） | ⚠️ **仅本机 CLI** | `~/.dws/`（default） |
 | `dws auth login --device`（无 `--sender-id`） | 运维 SSH 一次性初始化 dingmbw；本机无头 | ⚠️ **非 IM 用户授权** | `~/.dws/`（default） |
 | `dws auth status` / `logout` / `reset`（无 `--sender-id`） | 本机单用户 default 身份 | ⚠️ **仅本机 CLI** | `~/.dws/` |
@@ -42,8 +42,8 @@ dws auth login --sender-id <DWS_AUTH_IDENTITY> --device
 
 | 错误 | 处理 |
 |------|------|
-| `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED`（OpenClaw 钉钉） | `dws auth login --sender-id <DWS_AUTH_IDENTITY> --device` |
-| Step4 CLI 拒绝 / login exit 2 | 读 stderr 中文说明，见 [dws-auth-contract.md](./dws-auth-contract.md) |
+| `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED`（OpenClaw 钉钉） | Agent exec `auth login --sender-id <id> --device`；扫码后 `auth status` 确认 |
+| 业务 API CLI/权限拒绝 | 读 stderr 中文说明，见 [dws-auth-contract.md](./dws-auth-contract.md) |
 | `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL`（本机 default） | `dws auth login` 或 `dws auth login --device` |
 | HTTP 403 / scope 不足 | 联系管理员开权限，**不要**反复 login |
 
@@ -78,7 +78,7 @@ dws recovery finalize --event-id <event_id> --outcome recovered|failed|handoff -
 | `--debug` | | 调试日志 | false |
 | `--yes` | `-y` | 跳过确认提示 | false |
 | `--dry-run` | | 预览操作不执行 | false |
-| `--timeout` | | HTTP 超时 (秒) | 30 |
+| `--timeout` | | dws CLI **HTTP 请求**超时 (秒)，非 OpenClaw `exec timeout` | 30 |
 | `--mock` | | Mock 数据 (开发用) | false |
 | `--client-id` | | 覆盖 OAuth Client ID | 无 |
 | `--client-secret` | | 覆盖 OAuth Client Secret | 无 |

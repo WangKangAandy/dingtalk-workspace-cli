@@ -286,7 +286,7 @@ func TestOAuthCallback_CLIAuthDisabledByServer_ShowsNotEnabledPage(t *testing.T)
 // 5. Device Flow: loginOnce with broken cliAuthEnabled endpoint
 // ---------------------------------------------------------------------------
 
-func TestDeviceFlow_LoginOnce_CLIAuthError_FailClosed(t *testing.T) {
+func TestDeviceFlow_LoginOnce_CLIAuthError_StillSucceeds(t *testing.T) {
 	SetClientIDFromMCP("test-client-id")
 	t.Cleanup(func() {
 		SetClientID("")
@@ -346,18 +346,18 @@ func TestDeviceFlow_LoginOnce_CLIAuthError_FailClosed(t *testing.T) {
 		httpClient:      srv.Client(),
 	}
 
-	_, err := provider.loginOnce(context.Background(), 1)
+	token, err := provider.loginOnce(context.Background(), 1)
 
-	if err == nil {
-		t.Fatal("expected loginOnce to fail when CLI auth check fails, got nil")
+	if err != nil {
+		t.Fatalf("expected loginOnce to succeed without Step4 gate, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "检查 CLI 授权状态失败") && !strings.Contains(err.Error(), "Failed to check CLI auth status") {
-		t.Fatalf("unexpected error message: %s", err)
+	if token.AccessToken != "test-access-token" {
+		t.Fatalf("unexpected token: %s", token.AccessToken)
 	}
-	t.Logf("✅ Device Flow: CLI auth check error → login blocked: %s", err)
+	t.Logf("✅ Device Flow: CLI auth endpoint ignored at login → token persisted")
 }
 
-func TestDeviceFlow_LoginOnce_CLIAuthDisabled_ShowsError(t *testing.T) {
+func TestDeviceFlow_LoginOnce_CLIAuthDisabled_StillPersists(t *testing.T) {
 	SetClientIDFromMCP("test-client-id")
 	t.Cleanup(func() {
 		SetClientID("")
@@ -426,12 +426,15 @@ func TestDeviceFlow_LoginOnce_CLIAuthDisabled_ShowsError(t *testing.T) {
 		httpClient:      srv.Client(),
 	}
 
-	_, err := provider.loginOnce(context.Background(), 1)
+	token, err := provider.loginOnce(context.Background(), 1)
 
-	if err == nil {
-		t.Fatal("expected loginOnce to fail when CLI auth is disabled, got nil")
+	if err != nil {
+		t.Fatalf("expected loginOnce to succeed when CLI auth is disabled, got error: %v", err)
 	}
-	t.Logf("✅ Device Flow: CLI auth disabled by server → login blocked: %s", err)
+	if token.AccessToken != "test-access-token" {
+		t.Fatalf("unexpected token: %s", token.AccessToken)
+	}
+	t.Logf("✅ Device Flow: CLI auth disabled by server → token still persisted")
 }
 
 func TestDeviceFlow_LoginOnce_CLIAuthEnabled_Success(t *testing.T) {
