@@ -1,0 +1,355 @@
+package helpers
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
+)
+
+type captureRunner struct {
+	last executor.Invocation
+}
+
+func (r *captureRunner) Run(_ context.Context, invocation executor.Invocation) (executor.Result, error) {
+	r.last = invocation
+	return executor.Result{Invocation: invocation}, nil
+}
+
+func TestChatMessageSendByBotIgnoresLegacyRealBuildModeEnv(t *testing.T) {
+	t.Setenv("DWS_"+"BUILD_MODE", "real")
+
+	runner := &captureRunner{}
+	cmd := newChatMessageSendByBotCommand(runner)
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{
+		"--users", "user-001",
+		"--robot-code", "robot-001",
+		"--title", "Greeting",
+		"--text", "hello",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, out.String())
+	}
+
+	if got := runner.last.Tool; got != "batch_send_robot_msg_to_users" {
+		t.Fatalf("tool = %q, want batch_send_robot_msg_to_users", got)
+	}
+	if got := runner.last.Params["robotCode"]; got != "robot-001" {
+		t.Fatalf("robotCode = %#v, want robot-001", got)
+	}
+	if got := runner.last.CanonicalProduct; got != "bot" {
+		t.Fatalf("CanonicalProduct = %q, want bot", got)
+	}
+}
+
+func TestChatMessageSendRoutesByDestination(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantTool  string
+		wantKey   string
+		wantValue string
+	}{
+		{
+			name:      "group",
+			args:      []string{"--group", "cid-xyz", "--title", "t", "--text", "hello"},
+			wantTool:  "send_message_as_user",
+			wantKey:   "openConversation_id",
+			wantValue: "cid-xyz",
+		},
+		{
+			name:      "user-direct",
+			args:      []string{"--user", "034766", "--title", "t", "--text", "hi"},
+			wantTool:  "send_direct_message_as_user",
+			wantKey:   "receiverUserId",
+			wantValue: "034766",
+		},
+		{
+			name:      "open-dingtalk-id-direct",
+			args:      []string{"--open-dingtalk-id", "OP123", "--title", "t", "--text", "hi"},
+			wantTool:  "send_direct_message_as_user",
+			wantKey:   "receiverOpenDingTalkId",
+			wantValue: "OP123",
+		},
+		{
+			name:      "positional-text",
+			args:      []string{"--group", "cid-xyz", "--title", "t", "hello from positional"},
+			wantTool:  "send_message_as_user",
+			wantKey:   "text",
+			wantValue: "hello from positional",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &captureRunner{}
+			cmd := newChatMessageSendCommand(runner)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute() error = %v\noutput:\n%s", err, out.String())
+			}
+			if got := runner.last.Tool; got != tc.wantTool {
+				t.Fatalf("Tool = %q, want %q", got, tc.wantTool)
+			}
+			if got := runner.last.CanonicalProduct; got != "chat" {
+				t.Fatalf("CanonicalProduct = %q, want chat", got)
+			}
+			if got, ok := runner.last.Params[tc.wantKey]; !ok || got != tc.wantValue {
+				t.Fatalf("Params[%q] = %#v, want %q", tc.wantKey, got, tc.wantValue)
+			}
+		})
+	}
+}
+
+func TestChatMessageSendRejectsInvalidDestination(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "no-destination",
+			args:    []string{"--text", "hi"},
+			wantErr: "one of --group, --user, or --open-dingtalk-id is required",
+		},
+		{
+			name:    "group-and-user",
+			args:    []string{"--group", "cid-x", "--user", "034766", "--text", "hi"},
+			wantErr: "--group, --user, and --open-dingtalk-id are mutually exclusive",
+		},
+		{
+			name:    "empty-text",
+			args:    []string{"--group", "cid-x"},
+			wantErr: "--text (or positional argument) is required",
+		},
+		{
+			name:    "group-without-title",
+			args:    []string{"--group", "cid-x", "--text", "hi"},
+			wantErr: "--title is required for group messages",
+		},
+		{
+			name:    "direct-user-without-title",
+			args:    []string{"--user", "034766", "--text", "hi"},
+			wantErr: "--title is required for direct messages",
+		},
+		{
+			name:    "direct-open-dingtalk-id-without-title",
+			args:    []string{"--open-dingtalk-id", "OP123", "--text", "hi"},
+			wantErr: "--title is required for direct messages",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &captureRunner{}
+			cmd := newChatMessageSendCommand(runner)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(tc.args)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("expected error, got nil; output: %s", out.String())
+			}
+			if got := err.Error(); !strings.Contains(got, tc.wantErr) {
+				t.Fatalf("error = %q, want to contain %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestChatMessageSendForwardsAtMentions guards the regression introduced
+// alongside the destination-based routing in PR #170: the hardcoded helper
+// declared --group / --user / --open-dingtalk-id / --text / --title but
+// dropped the v1.0.15 envelope's --at-users / --at-all / --at-mobiles flags,
+// so `dws chat message send --group ... --at-users ...` failed with
+// `unknown flag: --at-users` (issue #177).
+func TestChatMessageSendForwardsAtMentions(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       []string
+		wantParams map[string]any
+	}{
+		{
+			name: "group-with-at-users",
+			args: []string{
+				"--group", "cid-xyz",
+				"--title", "拉群通知",
+				"--text", "<@uid-1> <@uid-2> 请关注",
+				"--at-users", "uid-1,uid-2",
+			},
+			wantParams: map[string]any{
+				"openConversation_id": "cid-xyz",
+				"title":               "拉群通知",
+				"text":                "<@uid-1> <@uid-2> 请关注",
+				"atUserIds":           []any{"uid-1", "uid-2"},
+			},
+		},
+		{
+			name: "group-with-at-all",
+			args: []string{
+				"--group", "cid-xyz",
+				"--title", "全员通知",
+				"--text", "<@all> 请关注",
+				"--at-all",
+			},
+			wantParams: map[string]any{
+				"openConversation_id": "cid-xyz",
+				"title":               "全员通知",
+				"text":                "<@all> 请关注",
+				"isAtAll":             true,
+			},
+		},
+		{
+			name: "group-with-at-mobiles",
+			args: []string{
+				"--group", "cid-xyz",
+				"--title", "提醒",
+				"--text", "请 13800000000 确认",
+				"--at-mobiles", "13800000000,13900000000",
+			},
+			wantParams: map[string]any{
+				"openConversation_id": "cid-xyz",
+				"title":               "提醒",
+				"text":                "请 13800000000 确认",
+				"atMobiles":           []any{"13800000000", "13900000000"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &captureRunner{}
+			cmd := newChatMessageSendCommand(runner)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute() error = %v\noutput:\n%s", err, out.String())
+			}
+			if got := runner.last.Tool; got != "send_message_as_user" {
+				t.Fatalf("Tool = %q, want send_message_as_user", got)
+			}
+			for key, want := range tc.wantParams {
+				got, ok := runner.last.Params[key]
+				if !ok {
+					t.Fatalf("Params missing %q; got %#v", key, runner.last.Params)
+				}
+				if !equalAny(got, want) {
+					t.Fatalf("Params[%q] = %#v, want %#v", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestChatMessageSendRejectsAtMentionsOutsideGroup ensures we do not silently
+// drop user intent when --at-* is combined with --user / --open-dingtalk-id
+// (single-chat tools have no @-mention semantics, so the flag would never
+// take effect — fail loudly instead of swallowing).
+func TestChatMessageSendRejectsAtMentionsOutsideGroup(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "user-with-at-users",
+			args: []string{"--user", "034766", "--text", "hi", "--at-users", "uid-1"},
+		},
+		{
+			name: "open-dingtalk-id-with-at-all",
+			args: []string{"--open-dingtalk-id", "OP123", "--text", "hi", "--at-all"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &captureRunner{}
+			cmd := newChatMessageSendCommand(runner)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(tc.args)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("expected error, got nil; output: %s", out.String())
+			}
+			if !strings.Contains(err.Error(), "only apply when --group is set") {
+				t.Fatalf("error = %q, want '...only apply when --group is set'", err.Error())
+			}
+		})
+	}
+}
+
+func equalAny(a, b any) bool {
+	switch av := a.(type) {
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if av[i] != bv[i] {
+				return false
+			}
+		}
+		return true
+	default:
+		return a == b
+	}
+}
+
+func TestChatMessageSendByBotRoutesToBotProduct(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantTool string
+	}{
+		{
+			name: "single-chat",
+			args: []string{
+				"--users", "user-001",
+				"--robot-code", "robot-001",
+				"--title", "t",
+				"--text", "x",
+			},
+			wantTool: "batch_send_robot_msg_to_users",
+		},
+		{
+			name: "group-chat",
+			args: []string{
+				"--group", "cid-xyz",
+				"--robot-code", "robot-001",
+				"--title", "t",
+				"--text", "x",
+			},
+			wantTool: "send_robot_group_message",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &captureRunner{}
+			cmd := newChatMessageSendByBotCommand(runner)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute() error = %v\noutput:\n%s", err, out.String())
+			}
+			if got := runner.last.CanonicalProduct; got != "bot" {
+				t.Fatalf("CanonicalProduct = %q, want bot", got)
+			}
+			if got := runner.last.Tool; got != tc.wantTool {
+				t.Fatalf("Tool = %q, want %q", got, tc.wantTool)
+			}
+		})
+	}
+}
