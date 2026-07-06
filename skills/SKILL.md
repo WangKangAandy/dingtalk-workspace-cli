@@ -138,17 +138,27 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 
 - **身份**：子进程会设置 `DWS_AUTH_IDENTITY=<当前聊天用户的 senderId>`（与全局 **`--sender-id <id>`** 等价）。`calendar` / `contact` / `doc` 等业务命令使用该 identity 的 token（`~/.dws/users/<senderId>/`）；**fail-closed**，不会混用部署者 default token。
 - **凭证（dingmbw vs ding6ui）**：用户 OAuth 与业务 API 使用 **dingmbw**，凭证来自本机 **`~/.dws/`**（`app.json` + `.data`），或 OpenClaw 配置 **`channels.dingtalk-connector.dwsApp`**（路径 2）。**Connector 不会**把机器人应用（ding6ui）的 `clientId`/`clientSecret` 注入为 `DWS_CLIENT_*`，以免覆盖 dingmbw、导致 token 与 client 不一致。
-- **未登录 / 过期**：在 connector 场景下，stderr 出现 `IDENTITY_NOT_AUTHENTICATED`、`AUTH_TOKEN_EXPIRED` 等时，**connector 会在当前会话推送 device 授权链接**；引导用户 **本人钉钉扫码** 后重试，无需 SSH 到网关执行 `dws auth login`。
+- **Agent 认证工作流**：会话含 `[DingTalk DWS Context]` 且用户请求需要任意 DWS 业务能力（如 `doc search` / `calendar` / `contact` / `wiki` / `drive`）时，先执行：
+  ```bash
+  dws auth status --sender-id <DWS_AUTH_IDENTITY> --format json
+  ```
+  如果 `authenticated` 为 `false`，必须在同一 Run 立刻执行：
+  ```bash
+  dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json
+  ```
+  `auth login` 不要设置 30s 级别的 exec 总超时；从 stdout/stderr 提取授权链接与 user_code/授权码回复用户。
+- **未登录 / 过期短路**：遇到 `IDENTITY_NOT_AUTHENTICATED`、`AUTH_TOKEN_EXPIRED`、`USER_TOKEN_ILLEGAL` 或 “未登录，无法发现 MCP 服务” 时，不要先解释“可以搜但未登录”、不要枚举登录方式、不要询问用户是否要登录；直接按上面的 `auth login --sender-id ... --device --format json` 发起授权，并只回复授权链接、user_code/授权码和“完成后再发我继续”。
 - **机器人发消息**：`dws chat message send-by-bot` 须按会话 **`[DingTalk Bot Context]`** 使用 **`--client-id <ding6ui AppKey>`**，与业务 dws 分离。
 - **错绑**：他人扫码完成 device 流时，落盘前校验失败会输出 **`IDENTITY_MISMATCH`**；须提示勿转发链接，由本人重新授权。
 
 ## 错误处理
-1. 遇到错误，加 `--verbose` 重试一次
-2. 若 stderr 出现 `RECOVERY_EVENT_ID=<event_id>`，优先按 [recovery-guide.md](./references/recovery-guide.md) 执行 recovery 闭环
-3. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
-4. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
-5. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
-6. **OpenClaw / 多用户**：stderr 一行 JSON 含 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` → 由 connector 推链或本地 `dws auth login --sender-id <id> --device`；`IDENTITY_MISMATCH` → 本人重扫；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
+1. 认证/未登录类错误优先级最高：`IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / “未登录，无法发现 MCP 服务” 直接按上方 OpenClaw 认证工作流处理，不要先做 `--verbose` 业务重试。
+2. 遇到非认证错误，加 `--verbose` 重试一次
+3. 若 stderr 出现 `RECOVERY_EVENT_ID=<event_id>`，优先按 [recovery-guide.md](./references/recovery-guide.md) 执行 recovery 闭环
+4. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
+5. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
+6. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
+7. **OpenClaw / 多用户**：`IDENTITY_MISMATCH` → 提示本人重新扫码；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
 
 
 ## 详细参考 (按需读取)
