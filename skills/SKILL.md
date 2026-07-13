@@ -132,6 +132,17 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 
 `dws schema` 输出的 `flag_overlay[key].alias` 就是实际生效的 flag 名（如 `attendeeUserIds → --attendee-user-ids`）；`parameters[key]` 是原始 JSON Schema；`required` 是必填字段数组；`sensitive: true` 表示写/删操作，须先向用户确认再加 `--yes`。
 
+### `doc update --content-file` 能力检查
+
+`cli_version` 仅表示 Skill 的基础兼容范围，当前安装器和 OpenClaw Connector 不会用它校验实际二进制版本。使用本地 Markdown 文件更新文档前，必须先执行：
+
+```bash
+dws doc update --help --format json
+```
+
+- 帮助中存在 `--content-file`：使用 `--content-file <path>` 读取本地文件。
+- 帮助中不存在 `--content-file`：停止操作并报告当前 CLI 不支持，禁止改用 `--markdown <path>` 或 `--content <path>`，以免把本地路径写入远端文档。
+
 ## OpenClaw / 钉钉机器人
 
 会话含 `[DingTalk DWS Context]` 或进程设置了 `DWS_AUTH_IDENTITY` 时，在执行任何 DWS 业务命令前，必须先完整读取并遵循 [global-reference.md 的“OpenClaw 钉钉 IM 多用户认证”](./references/global-reference.md#openclaw-钉钉-im-多用户认证)。认证流程完成前不得继续业务调用。

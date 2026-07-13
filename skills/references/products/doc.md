@@ -70,15 +70,17 @@ Flags:
 Usage:
   dws doc create [flags]
 Example:
-  dws doc create --name "项目周报"
-  dws doc create --name "Q1 总结" --markdown "# Q1 总结" --folder <FOLDER_ID>
-  dws doc create --name "知识库文档" --workspace <WS_ID>
+  dws doc create --name "项目周报" --format json
+  dws doc create --name "Q1 总结" --markdown "# Q1 总结" --folder <FOLDER_ID> --format json
+  dws doc create --name "知识库文档" --workspace <WS_ID> --format json
 Flags:
       --name string        文档名称 (必填)
       --folder string      目标文件夹 ID 或 URL
       --workspace string   目标知识库 ID
-      --markdown string    文档初始 Markdown 内容
+      --markdown string    文档初始 Markdown 字面量内容（不是本地文件路径）
 ```
+
+> `--markdown` 只接收正文字符串，不会读取本地文件。不要传入 `/tmp/a.md`、`./a.md` 等路径；长文档或本地 Markdown 文件应先创建文档，再用 `doc update --content-file` 写入。若确实要把路径作为正文展示，请将它包在 Markdown 反引号中。
 
 ### 创建其他类型文件 (表格/脑图/白板/多维表/画板)
 ```
@@ -101,13 +103,17 @@ Flags:
 Usage:
   dws doc update [flags]
 Example:
-  dws doc update --node <DOC_ID> --markdown "# 追加内容" --mode append
-  dws doc update --node <DOC_ID> --markdown "# 完整替换" --mode overwrite
+  dws doc update --node <DOC_ID> --content "# 追加内容" --mode append --format json
+  dws doc update --node <DOC_ID> --content "# 完整替换" --mode overwrite --format json
+  dws doc update --node <DOC_ID> --content-file ./report.md --mode overwrite --format json
 Flags:
-      --node string       文档 ID 或 URL (必填)
-      --markdown string   Markdown 内容 (必填)
-      --mode string       更新模式: overwrite=覆盖, append=追加 (默认 append)
+      --node string          文档 ID 或 URL (必填)
+      --content string       Markdown 字面量内容
+      --content-file string  从本地 UTF-8 文件读取 Markdown；- 表示 stdin
+      --mode string          更新模式: overwrite=覆盖, append=追加 (默认 append)
 ```
+
+`--content` 与 `--content-file` 必须且只能指定一个。前者是字面量正文，后者才会读取本地文件。
 
 ### 上传文件到钉钉文档或钉钉知识库
 ```
@@ -424,12 +430,27 @@ dws doc folder create --name "项目资料" --format json
 # 2. 创建文档 — 提取 nodeId
 dws doc create --name "项目周报" --folder <FOLDER_ID> --format json
 
-# 3. 写入内容 (追加模式)
-dws doc update --node <DOC_ID> --markdown "# 本周总结\n\n- 完成了 A\n- 推进了 B" --mode append --format json
+# 3. 写入短内容 (追加模式)
+dws doc update --node <DOC_ID> --content "# 本周总结
+
+- 完成了 A
+- 推进了 B" --mode append --format json
 
 # ── 工作流 3: 一步创建带内容的文档 ──
 
-dws doc create --name "会议纪要" --markdown "# 会议纪要\n\n## 议题\n\n1. ..." --format json
+dws doc create --name "会议纪要" --markdown "# 会议纪要
+
+## 议题
+
+1. ..." --format json
+
+# ── 工作流 3A: 从本地 Markdown 文件创建长文档 ──
+
+# 1. 先创建不带正文的文档，并从返回中提取 nodeId
+dws doc create --name "项目方案" --format json
+
+# 2. 再读取本地文件并覆盖写入；不要把文件路径传给 create --markdown
+dws doc update --node <DOC_ID> --content-file ./proposal.md --mode overwrite --format json
 
 # ── 工作流 4: 上传本地文件到钉钉文档/知识库 ──
 
@@ -549,11 +570,14 @@ dws doc read --node "https://alidocs.dingtalk.com/i/nodes/9E05BDRVQePjzLkZt2p2vE
 ## 注意事项
 
 - `update --mode overwrite` 会**清空原内容后重写**，⚠️ 谨慎使用；默认 `--mode append` (追加) 更安全
+- `create --markdown` 和 `update --content` 都接收 Markdown **字面量正文**，不是本地文件路径；禁止直接传入路径，否则执行环境中的本地路径可能被当作正文写入远端文档
+- 如果正文有意只展示一个路径，请使用 Markdown 行内代码（例如 `` `/docs/example.md` ``）或补充说明文字，使其不再与文件输入混淆
+- 读取本地 Markdown 必须使用 `update --content-file <path>`；创建长文档时采用“先 `create`，再 `update --content-file`”的两步流程
 - `read` 返回 Markdown 格式的文档内容，仅限有"下载"权限的文档
 - `create` 不传 `--folder` 和 `--workspace` 时，默认创建在"我的文档"根目录
 - `block list/insert/update/delete` 是块级精细编辑，适合结构化修改；简单内容追加建议用 `update --mode append`
 - `block insert` 优先使用 `--text` 或 `--heading` 快捷方式；复杂块类型 (table, callout 等) 使用 `--element` JSON
-- `markdown` 参数中的换行必须使用**真实换行符**（即实际的换行字符，Unicode `U+000A`），而不是字面量字符串 `\n`（反斜杠加字母 n）。在通过程序或大模型构造此参数时，请确保字符串在发送前已正确反转义。如果传入的是两个字符的字面量 `\n`，所有内容将渲染在同一行，导致标题、段落和表格格式全部错乱。
+- `create --markdown` / `update --content` 参数中的换行必须使用**真实换行符**（即实际的换行字符，Unicode `U+000A`），而不是字面量字符串 `\n`（反斜杠加字母 n）。在通过程序或大模型构造此参数时，请确保字符串在发送前已正确反转义。如果传入的是两个字符的字面量 `\n`，所有内容将渲染在同一行，导致标题、段落和表格格式全部错乱。
 - 块类型包括: paragraph, heading, blockquote, callout, columns, orderedList, unorderedList, table, sheet, attachment, slot
 - 关键区分: doc(文档编辑/阅读) vs aitable(数据表格操作) vs drive(钉盘文件管理)
 - `upload` 支持上传任意类型文件 (PDF、Office、图片等) 到钉钉文档空间或知识库；`--convert` 可将 Office 文件转换为钉钉在线文档
