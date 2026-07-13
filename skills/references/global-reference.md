@@ -2,22 +2,31 @@
 
 ## 认证
 
-### OpenClaw 钉钉 IM / 多用户
+### OpenClaw 钉钉 IM 多用户认证
 
-OpenClaw 会话含 `[DingTalk DWS Context]` 时，当前聊天用户由 `DWS_AUTH_IDENTITY` 标识。Agent 必须显式传 `--sender-id`，不要依赖 default token。
+本节是 OpenClaw 多用户认证与身份隔离规则的唯一事实源；`SKILL.md` 只定义何时必须读取本节。
+
+会话含 `[DingTalk DWS Context]` 或进程设置了 `DWS_AUTH_IDENTITY` 时：
+
+- **身份隔离**：当前聊天用户由 `DWS_AUTH_IDENTITY` 标识。Agent 必须显式传 `--sender-id`；`calendar` / `contact` / `doc` 等业务命令使用该 identity 的 token（`~/.dws/users/<senderId>/`）。认证缺失时 **fail-closed**，不得混用部署者的 default token。
+- **业务凭证**：用户 OAuth 与业务 API 使用 **dingmbw**，凭证来自本机 `~/.dws/`（`app.json` + `.data`）或 OpenClaw 配置 `channels.dingtalk-connector.dwsApp`。Connector 不得把机器人应用（ding6ui）的 `clientId` / `clientSecret` 注入为 `DWS_CLIENT_*`，以免覆盖 dingmbw、导致 token 与 client 不一致。
+- **机器人凭证**：会话含 `[DingTalk Bot Context]` 时，`dws chat message send-by-bot` 使用 `--client-id <ding6ui AppKey>`，不得与业务 DWS 凭证混用。
+
+执行任何 DWS 业务命令前，先检查当前聊天用户的授权状态：
 
 ```bash
 # 检查当前聊天用户是否已授权
 dws auth status --sender-id <DWS_AUTH_IDENTITY> --format json
 
-# 服务器/无头环境为当前聊天用户发起设备流授权
+# 未授权时，在服务器/无头环境发起设备流授权
 dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json
 ```
 
-处理规则：
+认证预检与错误处理规则：
 
 - `auth status` 返回 `authenticated: false` 后，必须同一 Run 立刻执行 `auth login --sender-id ... --device --format json`。
 - 业务命令返回 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / “未登录，无法发现 MCP 服务” 时，不解释登录方式、不询问是否发起登录，直接执行上面的 login。
+- `auth login` 不要设置 30s 级别的 exec 总超时；从 stdout/stderr 提取授权链接与 user_code/授权码。
 - 对用户只回复 login 输出里的授权链接、user_code/授权码，以及“完成后再发我继续”。
 - `IDENTITY_MISMATCH` 表示不是本人扫码；提示本人重新扫码。
 - HTTP 403 / scope 不足属于权限问题，联系管理员，不要反复 login。
@@ -25,7 +34,7 @@ dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json
 ### 本机 default 身份
 
 ```bash
-# 首次: OAuth 设备流登录 (钉钉扫码授权)
+# 首次: OAuth Loopback 登录 (本机浏览器扫码授权)
 dws auth login
 
 # 查看状态
@@ -48,8 +57,8 @@ dws auth reset
 30 天内使用一次即自动续期。
 
 ### 认证失败处理
-- 命令返回 `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / "Token验证失败" → 执行 `dws auth login` 重新登录
-- OpenClaw 钉钉 IM 中的未登录/过期错误 → 执行 `dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json`
+- OpenClaw 钉钉 IM / `DWS_AUTH_IDENTITY` 场景 → 严格按上方多用户认证流程处理，不进入通用重试
+- 本机 default 身份返回 `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / "Token验证失败" → 执行 `dws auth login` 重新登录
 
 ### Headless 环境 (CI/CD)
 
@@ -97,6 +106,7 @@ dws recovery finalize --event-id <event_id> --outcome recovered|failed|handoff -
 | `--mock` | | Mock 数据 (开发用) | false |
 | `--client-id` | | 覆盖 OAuth Client ID | 无 |
 | `--client-secret` | | 覆盖 OAuth Client Secret | 无 |
+| `--sender-id` | | 指定钉钉用户身份（与 `DWS_AUTH_IDENTITY` 等价） | 无 |
 
 ## 输出格式
 
@@ -123,5 +133,8 @@ dws recovery finalize --event-id <event_id> --outcome recovered|failed|handoff -
 | `DWS_SERVERS_URL` | 自定义服务发现端点 |
 | `DWS_CLIENT_ID` | 覆盖 OAuth Client ID (DingTalk AppKey) |
 | `DWS_CLIENT_SECRET` | 覆盖 OAuth Client Secret (DingTalk AppSecret) |
+| `DWS_AUTH_IDENTITY` | 指定钉钉用户身份，隔离多用户 OAuth token |
+
+身份选择优先级: `--sender-id` > `DWS_AUTH_IDENTITY` > `default`。
 
 凭证优先级: `--token` > `DWS_CLIENT_ID`/`DWS_CLIENT_SECRET` > OAuth 加密存储 (.data)

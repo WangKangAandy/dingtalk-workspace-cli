@@ -132,33 +132,18 @@ dws schema <path> --jq '.tool.required'      # 只看必填字段
 
 `dws schema` 输出的 `flag_overlay[key].alias` 就是实际生效的 flag 名（如 `attendeeUserIds → --attendee-user-ids`）；`parameters[key]` 是原始 JSON Schema；`required` 是必填字段数组；`sensitive: true` 表示写/删操作，须先向用户确认再加 `--yes`。
 
-## OpenClaw / 钉钉机器人（多用户 OAuth，MVP）
+## OpenClaw / 钉钉机器人
 
-当 **OpenClaw dingtalk-connector** 通过终端调用本 CLI 时（与本地单独使用 `dws` 均适用）：
+会话含 `[DingTalk DWS Context]` 或进程设置了 `DWS_AUTH_IDENTITY` 时，在执行任何 DWS 业务命令前，必须先完整读取并遵循 [global-reference.md 的“OpenClaw 钉钉 IM 多用户认证”](./references/global-reference.md#openclaw-钉钉-im-多用户认证)。认证流程完成前不得继续业务调用。
 
-- **身份**：子进程会设置 `DWS_AUTH_IDENTITY=<当前聊天用户的 senderId>`（与全局 **`--sender-id <id>`** 等价）。`calendar` / `contact` / `doc` 等业务命令使用该 identity 的 token（`~/.dws/users/<senderId>/`）；**fail-closed**，不会混用部署者 default token。
-- **凭证（dingmbw vs ding6ui）**：用户 OAuth 与业务 API 使用 **dingmbw**，凭证来自本机 **`~/.dws/`**（`app.json` + `.data`），或 OpenClaw 配置 **`channels.dingtalk-connector.dwsApp`**（路径 2）。**Connector 不会**把机器人应用（ding6ui）的 `clientId`/`clientSecret` 注入为 `DWS_CLIENT_*`，以免覆盖 dingmbw、导致 token 与 client 不一致。
-- **Agent 认证工作流**：会话含 `[DingTalk DWS Context]` 且用户请求需要任意 DWS 业务能力（如 `doc search` / `calendar` / `contact` / `wiki` / `drive`）时，先执行：
-  ```bash
-  dws auth status --sender-id <DWS_AUTH_IDENTITY> --format json
-  ```
-  如果 `authenticated` 为 `false`，必须在同一 Run 立刻执行：
-  ```bash
-  dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json
-  ```
-  `auth login` 不要设置 30s 级别的 exec 总超时；从 stdout/stderr 提取授权链接与 user_code/授权码回复用户。
-- **未登录 / 过期短路**：遇到 `IDENTITY_NOT_AUTHENTICATED`、`AUTH_TOKEN_EXPIRED`、`USER_TOKEN_ILLEGAL` 或 “未登录，无法发现 MCP 服务” 时，不要先解释“可以搜但未登录”、不要枚举登录方式、不要询问用户是否要登录；直接按上面的 `auth login --sender-id ... --device --format json` 发起授权，并只回复授权链接、user_code/授权码和“完成后再发我继续”。
-- **机器人发消息**：`dws chat message send-by-bot` 须按会话 **`[DingTalk Bot Context]`** 使用 **`--client-id <ding6ui AppKey>`**，与业务 dws 分离。
-- **错绑**：他人扫码完成 device 流时，落盘前校验失败会输出 **`IDENTITY_MISMATCH`**；须提示勿转发链接，由本人重新授权。
+会话含 `[DingTalk Bot Context]` 且需以机器人身份发消息时，也必须先读取该章节，按其中的应用凭证边界执行。
 
 ## 错误处理
-1. 认证/未登录类错误优先级最高：`IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / “未登录，无法发现 MCP 服务” 直接按上方 OpenClaw 认证工作流处理，不要先做 `--verbose` 业务重试。
+1. 认证/未登录类错误优先级最高：立即按 [全局认证参考](./references/global-reference.md#认证) 处理，不要先做 `--verbose` 业务重试
 2. 遇到非认证错误，加 `--verbose` 重试一次
 3. 若 stderr 出现 `RECOVERY_EVENT_ID=<event_id>`，优先按 [recovery-guide.md](./references/recovery-guide.md) 执行 recovery 闭环
 4. 仍然失败，报告完整错误信息给用户，禁止自行尝试替代方案
-5. 认证失败时，参考 [global-reference.md](./references/global-reference.md) 中的认证章节处理
-6. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
-7. **OpenClaw / 多用户**：`IDENTITY_MISMATCH` → 提示本人重新扫码；**HTTP 403 且为 scope/权限** → 联系管理员，**不要**一律引导 `auth login`。
+5. 各产品高频错误及排查流程见 [error-codes.md](./references/error-codes.md)
 
 
 ## 详细参考 (按需读取)
