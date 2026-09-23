@@ -1,5 +1,7 @@
 # 文档 (doc) 命令参考
 
+OpenClaw 场景：下载到本地时落到已展开的绝对路径 `$HOME/.openclaw/media/inbound/`，不要写到当前目录。
+
 ## 命令总览
 
 ### 搜索文档
@@ -444,8 +446,6 @@ dws doc upload --file ./slides.pptx --name "Q1汇报.pptx" --folder <FOLDER_ID>
 dws doc upload --file ./data.xlsx --workspace <WS_ID> --convert
 
 # ── 工作流 5: 下载文件到本地 ──
-
-# OpenClaw 场景：下载到已展开的绝对路径 $HOME/.openclaw/media/inbound/，不要落到当前目录。
 
 # 1. 下载到当前目录 (自动推断文件名)
 dws doc download --node <NODE_ID>
