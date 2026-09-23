@@ -2,6 +2,8 @@
 
 钉盘 = DingTalk Drive，用于云端文件存储 / 上传 / 下载 / 目录管理。不是在线文档编辑；要编辑文档请用 [doc](./doc.md)。
 
+OpenClaw 场景：把文件存到本地时落到已展开的绝对路径 `$HOME/.openclaw/media/inbound/`，不要写到当前目录。
+
 ## 命令总览
 
 ### 列出钉盘目录
@@ -137,7 +139,7 @@ dws drive download --file-id <FILE_ID> --format json
 # → 返回: resourceUrl (带签名的临时下载 URL), expirationSeconds
 
 # Step 2: Agent 自己发 HTTP GET 下载二进制
-curl -o "$HOME/.openclaw/media/inbound/report.pdf" "<resourceUrl>"
+curl -o ./report.pdf "<resourceUrl>"
 
 # ── 工作流 4: 建目录后批量上传 ──
 
