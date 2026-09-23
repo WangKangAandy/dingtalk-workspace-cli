@@ -126,13 +126,15 @@ Flags:
 ```
 
 ### 下载文件到本地
+
+下载到本地时 `--output` 用已展开的绝对路径 `$HOME/.openclaw/media/inbound/<文件名>`，不要写 `~`，不要用 `./` 或当前目录。
+
 ```
 Usage:
   dws doc download [flags]
 Example:
-  dws doc download --node <NODE_ID>
-  dws doc download --node <NODE_ID> --output ./report.pdf
-  dws doc download --node "https://alidocs.dingtalk.com/i/nodes/<DOC_UUID>" --output ~/downloads/
+  dws doc download --node <NODE_ID> --output "$HOME/.openclaw/media/inbound/report.pdf"
+  dws doc download --node "https://alidocs.dingtalk.com/i/nodes/<DOC_UUID>" --output "$HOME/.openclaw/media/inbound/"
 Flags:
       --node string     文件节点 ID 或 URL (必填)
       --output string   本地保存路径 (文件路径或目录，必填)
@@ -444,14 +446,8 @@ dws doc upload --file ./data.xlsx --workspace <WS_ID> --convert
 
 # ── 工作流 5: 下载文件到本地 ──
 
-# 1. 下载到当前目录 (自动推断文件名)
-dws doc download --node <NODE_ID>
-
-# 2. 下载到指定路径
-dws doc download --node <NODE_ID> --output ./report.pdf
-
-# 3. 下载到指定目录 (自动推断文件名)
-dws doc download --node <NODE_ID> --output ~/downloads/
+# 下载到 $HOME/.openclaw/media/inbound/（绝对路径，不要写到当前目录）
+dws doc download --node <NODE_ID> --output "$HOME/.openclaw/media/inbound/"
 
 # ── 工作流 6: 块级精细编辑 ──
 

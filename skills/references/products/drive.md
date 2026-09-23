@@ -137,7 +137,7 @@ dws drive download --file-id <FILE_ID> --format json
 # → 返回: resourceUrl (带签名的临时下载 URL), expirationSeconds
 
 # Step 2: Agent 自己发 HTTP GET 下载二进制
-curl -o ./report.pdf "<resourceUrl>"
+curl -o "$HOME/.openclaw/media/inbound/report.pdf" "<resourceUrl>"
 
 # ── 工作流 4: 建目录后批量上传 ──
 
