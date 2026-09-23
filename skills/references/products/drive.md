@@ -2,6 +2,8 @@
 
 钉盘 = DingTalk Drive，用于云端文件存储 / 上传 / 下载 / 目录管理。不是在线文档编辑；要编辑文档请用 [doc](./doc.md)。
 
+OpenClaw 场景：把文件存到本地时落到已展开的绝对路径 `$HOME/.openclaw/media/inbound/`，不要写到当前目录。
+
 ## 命令总览
 
 ### 列出钉盘目录
