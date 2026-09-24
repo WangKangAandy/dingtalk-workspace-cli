@@ -113,7 +113,7 @@ dws upgrade -y                 # 跳过确认直接升级
 升级过程采用两阶段原子流程，确保一致性：
 
 1. **准备阶段** — 将平台对应的二进制文件和技能包下载到临时目录，校验 SHA256 校验和，解压并验证所有文件。任何步骤失败则立即中止，不会修改现有安装。
-2. **执行阶段** — 仅在所有准备工作成功后，替换二进制文件并将技能包安装到所有已检测到的 Agent 目录（`~/.agents/skills/dws`、`~/.claude/skills/dws`、`~/.cursor/skills/dws` 等）。
+2. **执行阶段** — 仅在所有准备工作成功后，替换二进制文件，并将技能包装到一份 Agent 目录（默认 `~/.agents/skills/dws`；`DWS_AGENT=openclaw` 则装到 `~/.openclaw/skills/dws`；`all` 才恢复旧的多家目录拷贝）。
 
 每次升级前自动备份当前版本，可通过 `dws upgrade --rollback` 随时回滚。
 
@@ -237,7 +237,7 @@ dws aitable record query --base-id BASE_ID --table-id TABLE_ID --limit 10
 curl -fsSL https://raw.githubusercontent.com/DingTalk-Real-AI/dingtalk-workspace-cli/main/scripts/install-skills.sh | sh
 ```
 
-> `install.sh` 安装到 `$HOME/.agents/skills/dws`（全局）；`install-skills.sh` 安装到 `./.agents/skills/dws`（当前项目）。
+> `install.sh` 默认安装到 `$HOME/.agents/skills/dws`（全局，一份）；`install-skills.sh` 默认安装到 `./.agents/skills/dws`（当前项目）。用 `--agent openclaw` 或 `DWS_AGENT=openclaw` 只装到 `.openclaw/skills/dws`；`all` 才恢复旧的多家目录拷贝。
 
 **包含内容：**
 

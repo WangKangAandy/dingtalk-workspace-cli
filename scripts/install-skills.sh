@@ -1,23 +1,50 @@
 #!/bin/sh
 set -eu
 
-# Install DWS agent skills from GitHub Releases into agent skill directories.
+# Install DWS agent skills from GitHub Releases into one agent skill directory.
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DingTalk-Real-AI/dingtalk-workspace-cli/main/scripts/install-skills.sh | sh
+#   curl -fsSL .../install-skills.sh | sh
+#   sh scripts/install-skills.sh --agent openclaw
+#   DWS_SKILLS_ROOT=$HOME DWS_AGENT=openclaw sh scripts/install-skills.sh
 #
-# Downloads dws-skills.zip from GitHub Releases and copies it under each target
-# path using the same rules as build/npm/install.js installSkillsToHomes
-# (AGENT_DIRS + parent-directory gate), with root defaulting to the current
-# directory. Set DWS_SKILLS_ROOT=$HOME to match npm install layout exactly.
+# Default installs only to <root>/.agents/skills/dws.
+# Pass --agent / DWS_AGENT to choose another home, or --agent all for the old
+# multi-home copy (only when those parent dirs already exist).
 #
 # Environment variables (optional):
 #   DWS_VERSION        — release tag (default: latest)
 #   DWS_SKILLS_ROOT    — base path for agent dirs (default: $PWD)
+#   DWS_AGENT          — agents | openclaw | claude | cursor | ... | all
+#                        (default: agents; overridden by --agent)
 
 REPO="DingTalk-Real-AI/dingtalk-workspace-cli"
 VERSION="${DWS_VERSION:-latest}"
 SKILL_NAME="dws"
 ROOT="${DWS_SKILLS_ROOT:-$PWD}"
+AGENT="${DWS_AGENT:-agents}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent)
+      [ $# -ge 2 ] || { printf '❌ --agent needs a value\n' >&2; exit 1; }
+      AGENT="$2"
+      shift 2
+      ;;
+    --agent=*)
+      AGENT="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      printf 'Usage: install-skills.sh [--agent agents|openclaw|claude|cursor|gemini|codex|github|windsurf|augment|cline|amp|kiro|trae|hermes|all]\n'
+      printf 'Env: DWS_VERSION DWS_SKILLS_ROOT DWS_AGENT\n'
+      exit 0
+      ;;
+    *)
+      printf '❌ Unknown argument: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -51,6 +78,30 @@ extract_zip() {
   fi
   printf '❌ Missing required command: unzip (or tar with zip support)\n' >&2
   exit 1
+}
+
+agent_skill_relpath() {
+  case "$1" in
+    agents) printf '%s\n' ".agents/skills" ;;
+    openclaw) printf '%s\n' ".openclaw/skills" ;;
+    claude) printf '%s\n' ".claude/skills" ;;
+    cursor) printf '%s\n' ".cursor/skills" ;;
+    gemini) printf '%s\n' ".gemini/skills" ;;
+    codex) printf '%s\n' ".codex/skills" ;;
+    github) printf '%s\n' ".github/skills" ;;
+    windsurf) printf '%s\n' ".windsurf/skills" ;;
+    augment) printf '%s\n' ".augment/skills" ;;
+    cline) printf '%s\n' ".cline/skills" ;;
+    amp) printf '%s\n' ".amp/skills" ;;
+    kiro) printf '%s\n' ".kiro/skills" ;;
+    trae) printf '%s\n' ".trae/skills" ;;
+    hermes) printf '%s\n' ".hermes/skills" ;;
+    all) printf '%s\n' "all" ;;
+    *)
+      printf '❌ Unknown agent %s (use agents|openclaw|claude|cursor|...|all)\n' "$1" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # One-line summary copy (2nd+ targets).
@@ -97,10 +148,36 @@ _copy_skill() {
   done
 }
 
-# Same semantics as build/npm/install.js installSkillsToHomes (root = DWS_SKILLS_ROOT or PWD).
+_copy_one() {
+  skill_src="$1"
+  root="$2"
+  agent_dir="$3"
+  first="$4"
+  dest="$root/$agent_dir/$SKILL_NAME"
+  if [ "$root" = "$HOME" ]; then
+    label="~/$agent_dir/$SKILL_NAME"
+  else
+    label="$root/$agent_dir/$SKILL_NAME"
+  fi
+  if [ "$first" = "1" ]; then
+    _copy_skill "$skill_src" "$dest" "$label"
+  else
+    _copy_skill_summary "$skill_src" "$dest" "$label"
+  fi
+}
+
+# Default: one agent dir. --agent all keeps the old multi-home copy.
 install_skills_to_root() {
   skill_src="$1"
   root="$2"
+  agent_key="$3"
+  relpath="$(agent_skill_relpath "$agent_key")"
+
+  if [ "$relpath" != "all" ]; then
+    _copy_one "$skill_src" "$root" "$relpath" 1
+    return 0
+  fi
+
   installed=0
   idx=0
   for agent_dir in \
@@ -125,27 +202,16 @@ install_skills_to_root() {
       idx=$((idx + 1))
       continue
     fi
-    dest="$base_dir/$SKILL_NAME"
-    if [ "$root" = "$HOME" ]; then
-      label="~/$agent_dir/$SKILL_NAME"
-    else
-      label="$root/$agent_dir/$SKILL_NAME"
-    fi
     if [ "$installed" -eq 0 ]; then
-      _copy_skill "$skill_src" "$dest" "$label"
+      _copy_one "$skill_src" "$root" "$agent_dir" 1
     else
-      _copy_skill_summary "$skill_src" "$dest" "$label"
+      _copy_one "$skill_src" "$root" "$agent_dir" 0
     fi
     installed=$((installed + 1))
     idx=$((idx + 1))
   done
   if [ "$installed" -eq 0 ]; then
-    if [ "$root" = "$HOME" ]; then
-      flabel="~/.agents/skills/$SKILL_NAME"
-    else
-      flabel="$root/.agents/skills/$SKILL_NAME"
-    fi
-    _copy_skill "$skill_src" "$root/.agents/skills/$SKILL_NAME" "$flabel"
+    _copy_one "$skill_src" "$root" ".agents/skills" 1
   fi
 }
 
@@ -154,6 +220,8 @@ install_skills_to_root() {
 main() {
   need_cmd curl
   resolve_version
+  # Validate agent early.
+  agent_skill_relpath "$AGENT" >/dev/null
 
   printf '\n'
   printf '  ┌──────────────────────────────────────┐\n'
@@ -181,8 +249,8 @@ main() {
   fi
 
   printf '\n'
-  printf '  Installing under root: %s\n' "$ROOT"
-  install_skills_to_root "$SKILL_SRC" "$ROOT"
+  printf '  Installing under root: %s (agent=%s)\n' "$ROOT" "$AGENT"
+  install_skills_to_root "$SKILL_SRC" "$ROOT" "$AGENT"
 
   printf '\n'
   printf '  📖 Skill includes:\n'

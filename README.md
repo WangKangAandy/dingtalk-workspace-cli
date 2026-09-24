@@ -113,7 +113,7 @@ dws upgrade -y                 # skip confirmation prompt
 The upgrade process follows a two-phase atomic flow to ensure consistency:
 
 1. **Prepare** — downloads the platform-specific binary and skill packages to a temporary directory, verifies SHA256 checksums, and extracts/validates all files. If any step fails, the upgrade aborts without modifying the existing installation.
-2. **Apply** — only after all preparations succeed, the binary is replaced and skill packages are installed to all detected agent directories (`~/.agents/skills/dws`, `~/.claude/skills/dws`, `~/.cursor/skills/dws`, etc.).
+2. **Apply** — only after all preparations succeed, the binary is replaced and the skill package is installed to one agent directory (default `~/.agents/skills/dws`; set `DWS_AGENT=openclaw` for `~/.openclaw/skills/dws`, or `DWS_AGENT=all` for the old multi-home copy).
 
 A backup of the current version is automatically created before each upgrade. Use `dws upgrade --rollback` to restore the previous version if needed.
 
@@ -237,7 +237,7 @@ The repo ships a complete Agent Skill system (`skills/`). After installing, AI t
 curl -fsSL https://raw.githubusercontent.com/DingTalk-Real-AI/dingtalk-workspace-cli/main/scripts/install-skills.sh | sh
 ```
 
-> `install.sh` installs to `$HOME/.agents/skills/dws` (global); `install-skills.sh` installs to `./.agents/skills/dws` (current project).
+> `install.sh` installs to `$HOME/.agents/skills/dws` by default (one home); `install-skills.sh` installs to `./.agents/skills/dws`. Use `--agent openclaw` or `DWS_AGENT=openclaw` for `.openclaw/skills/dws`; `all` restores the old multi-home copy.
 
 **What's included:**
 
