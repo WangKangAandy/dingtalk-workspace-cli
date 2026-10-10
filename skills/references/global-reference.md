@@ -24,12 +24,11 @@ dws auth login --sender-id <DWS_AUTH_IDENTITY> --device --format json
 
 认证预检与错误处理规则：
 
-- `auth status` 返回 `authenticated: false` 后，必须同一 Run 立刻执行 `auth login --sender-id ... --device --format json`。
-- 业务命令返回 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / “未登录，无法发现 MCP 服务” 时，不解释登录方式、不询问是否发起登录，直接执行上面的 login。
-- `auth login` 不要设置 30s 级别的 exec 总超时；从 stdout/stderr 提取授权链接与 user_code/授权码。
-- 对用户只回复 login 输出里的授权链接、user_code/授权码，以及“完成后再发我继续”。
-- `IDENTITY_MISMATCH` 表示不是本人扫码；提示本人重新扫码。
-- HTTP 403 / scope 不足属于权限问题，联系管理员，不要反复 login。
+1. `auth status` 为 `authenticated: false`，或业务命令返回 `IDENTITY_NOT_AUTHENTICATED` / `AUTH_TOKEN_EXPIRED` / `USER_TOKEN_ILLEGAL` / “未登录，无法发现 MCP 服务”时：不解释、不询问，同一 Run 立刻 `auth login --sender-id ... --device --format json`。
+2. 设备流先打授权框，再轮询扫码（最长约 900s）。exec 只取**首屏**（链接 + user_code）；禁止 `| head` 等非 TTY 管道；禁止 120s 及以下总超时。首屏未出现则改 `nohup` 落文件再读，禁止 `process poll` 等到授权结束。
+3. 抽出链接和码后本回合只回复这三样并结束：授权链接、user_code、「完成后再发我继续」。不要在同一回合等扫码。
+4. 用户回复后再 `auth status`；仍未登录就再发一次链接。不要把「好了」当成已授权去跑业务命令。
+5. `IDENTITY_MISMATCH`：本人重新扫码。HTTP 403 / scope 不足：联系管理员，不要反复 login。
 
 ### 本机 default 身份
 
