@@ -135,12 +135,10 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 	port := listener.Addr().(*net.TCPAddr).Port
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, CallbackPath)
 
-	// Channel to pass callback result (token data or error with CLI auth status)
+	// Channel to pass callback result (token data or exchange error).
 	type callbackResult struct {
-		token           *TokenData
-		err             error
-		cliAuthDisabled bool
-		denialReason    string
+		token *TokenData
+		err   error
 	}
 	resultCh := make(chan callbackResult, 1)
 	errCh := make(chan error, 1)
@@ -149,7 +147,6 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 	var (
 		callbackToken           *TokenData
 		callbackProcessedCode   string // The auth code that has been successfully processed
-		callbackAuthDisabled    bool
 		callbackApplySent       bool   // Whether apply request was sent
 		callbackSelectedAdminId string // Selected admin ID for apply
 		callbackCodeInProgress  string // Code currently being processed (to prevent concurrent exchange)
@@ -167,7 +164,6 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		// Check state and handle page refresh or concurrent requests
 		callbackTokenMu.Lock()
 		processedCode := callbackProcessedCode
-		processedAuthDisabled := callbackAuthDisabled
 		codeInProgress := callbackCodeInProgress
 		hasToken := callbackToken != nil
 
@@ -175,11 +171,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		if code != "" && code == processedCode {
 			callbackTokenMu.Unlock()
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if processedAuthDisabled {
-				_, _ = fmt.Fprint(w, notEnabledHTML)
-			} else {
-				_, _ = fmt.Fprint(w, successHTML)
-			}
+			_, _ = fmt.Fprint(w, successHTML)
 			return
 		}
 
@@ -195,11 +187,7 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		if code == "" && hasToken {
 			callbackTokenMu.Unlock()
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if processedAuthDisabled {
-				_, _ = fmt.Fprint(w, notEnabledHTML)
-			} else {
-				_, _ = fmt.Fprint(w, successHTML)
-			}
+			_, _ = fmt.Fprint(w, successHTML)
 			return
 		}
 
@@ -251,40 +239,16 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		}
 		callbackTokenMu.Unlock()
 
-		// Check CLI auth enabled status (fail-closed: treat errors as disabled)
-		authStatus, statusErr := p.CheckCLIAuthEnabled(ctx, tokenData.AccessToken)
-		var denialReason string
-		if statusErr != nil {
-			denialReason = "unknown"
-		} else {
-			denialReason = classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL"))
-		}
-		cliAuthEnabled := denialReason == ""
-
-		// Update CLI auth disabled state
-		callbackTokenMu.Lock()
-		callbackAuthDisabled = !cliAuthEnabled
-		callbackTokenMu.Unlock()
-
-		// Display appropriate HTML based on auth status and denial reason
+		// OAuth exchange succeeded; org CLI policy is enforced on business API calls.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		switch {
-		case cliAuthEnabled:
-			_, _ = fmt.Fprint(w, successHTML)
-		case denialReason == "user_forbidden" || denialReason == "user_not_allowed":
-			_, _ = fmt.Fprint(w, accessDeniedHTML)
-		case denialReason == "channel_not_allowed" || denialReason == "channel_required":
-			_, _ = fmt.Fprint(w, channelDeniedHTML)
-		default:
-			_, _ = fmt.Fprint(w, notEnabledHTML)
-		}
+		_, _ = fmt.Fprint(w, successHTML)
 		// Ensure response is flushed to client
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 		// Notify main goroutine with full result
 		select {
-		case resultCh <- callbackResult{token: tokenData, cliAuthDisabled: !cliAuthEnabled, denialReason: denialReason}:
+		case resultCh <- callbackResult{token: tokenData}:
 		default:
 		}
 	})
@@ -423,76 +387,6 @@ func (p *OAuthProvider) Login(ctx context.Context, force bool) (*TokenData, erro
 		return nil, fmt.Errorf("%s: %w", i18n.T("换取 token 失败"), result.err)
 	}
 
-	// Handle CLI auth disabled - for terminal denial reasons, exit immediately
-	// (page shows accessDeniedHTML/channelDeniedHTML with no apply button,
-	// so polling for apply submission would hang forever).
-	// Error messages are kept consistent with the text shown on the HTML pages.
-	if result.cliAuthDisabled {
-		switch result.denialReason {
-		case "user_forbidden", "user_not_allowed":
-			return nil, errors.New(i18n.T("您不在该组织的 CLI 授权人员范围内，请联系组织管理员将您加入授权名单"))
-		case "channel_not_allowed", "channel_required":
-			return nil, errors.New(i18n.T("当前渠道未获得该组织授权，或组织已开启渠道管控，请联系组织管理员开通渠道访问权限，或升级到最新版本的 CLI"))
-		}
-
-		_, _ = fmt.Fprintln(p.output(), "")
-		_, _ = fmt.Fprintln(p.output(), i18n.T("⏳ 该组织尚未开启 CLI 数据访问权限，请在浏览器中提交授权申请..."))
-
-		// Poll for CLI auth status while waiting
-		applyTimeout := time.NewTimer(10 * time.Minute)
-		defer applyTimeout.Stop()
-		pollTicker := time.NewTicker(5 * time.Second)
-		defer pollTicker.Stop()
-
-		elapsedSeconds := 0
-		for {
-			select {
-			case <-applyTimeout.C:
-				return nil, errors.New(i18n.T("操作超时，请重新登录"))
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-pollTicker.C:
-				elapsedSeconds += 5
-
-				// Get latest token and state (user may have switched org)
-				callbackTokenMu.Lock()
-				currentToken := callbackToken
-				currentAuthDisabled := callbackAuthDisabled
-				applySent := callbackApplySent
-				callbackTokenMu.Unlock()
-
-				// Check if user switched to an org with CLI auth enabled
-				if currentToken != nil && !currentAuthDisabled {
-					_, _ = fmt.Fprintf(p.output(), "\r%s\n", i18n.T("✅ 权限已开启，继续登录..."))
-					time.Sleep(2 * time.Second)
-					result.token = currentToken
-					result.cliAuthDisabled = false
-					goto continueLogin
-				}
-
-				// Check if CLI auth is now enabled (admin approved)
-				if currentToken != nil {
-					authStatus, err := p.CheckCLIAuthEnabled(ctx, currentToken.AccessToken)
-					if err == nil && classifyDenialReason(authStatus, os.Getenv("DWS_CHANNEL")) == "" {
-						_, _ = fmt.Fprintf(p.output(), "\r%s\n", i18n.T("✅ 权限已开启，继续登录..."))
-						time.Sleep(2 * time.Second)
-						result.token = currentToken
-						result.cliAuthDisabled = false
-						goto continueLogin
-					}
-				}
-
-				// Show polling status based on apply state
-				if applySent {
-					_, _ = fmt.Fprintf(p.output(), "\r⏳ %s (%ds/600s)   ", i18n.T("等待管理员审批中"), elapsedSeconds)
-				} else {
-					_, _ = fmt.Fprintf(p.output(), "\r⏳ %s (%ds/600s)   ", i18n.T("等待提交申请中"), elapsedSeconds)
-				}
-			}
-		}
-	}
-
-continueLogin:
 	tokenData := result.token
 
 	// Save token data with associated client ID for refresh
