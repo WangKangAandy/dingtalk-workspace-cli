@@ -1,5 +1,7 @@
 # 文档 (doc) 命令参考
 
+OpenClaw 场景：下载到本地时落到已展开的绝对路径 `$HOME/.openclaw/media/inbound/`，不要写到当前目录。
+
 ## 命令总览
 
 ### 搜索文档
@@ -126,6 +128,7 @@ Flags:
 ```
 
 ### 下载文件到本地
+
 ```
 Usage:
   dws doc download [flags]

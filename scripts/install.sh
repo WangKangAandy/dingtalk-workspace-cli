@@ -14,8 +14,11 @@
 #   DWS_VERSION       — version to install             (default: latest)
 #   DWS_NO_SKILLS     — set to 1 to skip skills install
 #   DWS_SKILLS_ONLY   — set to 1 to install only skills (skip binary)
+#   DWS_AGENT         — agents | openclaw | claude | ... | all
+#                        (default: agents — one skill home only)
 #
-# Agent skills paths follow build/npm/install.js AGENT_DIRS (order and entries must match).
+# Default skill target is ~/.agents/skills/dws. Use DWS_AGENT=openclaw for
+# ~/.openclaw/skills/dws, or DWS_AGENT=all for the old multi-home copy.
 
 set -eu
 
@@ -27,6 +30,7 @@ VERSION="${DWS_VERSION:-latest}"
 NO_SKILLS="${DWS_NO_SKILLS:-0}"
 SKILLS_ONLY="${DWS_SKILLS_ONLY:-0}"
 SKILL_NAME="dws"
+AGENT="${DWS_AGENT:-agents}"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -182,10 +186,46 @@ install_skills_local() {
   return 0
 }
 
-# Install skill tree into all agent homes (same rules as build/npm/install.js installSkillsToHomes).
+# Install skill into one agent home (default). DWS_AGENT=all keeps multi-home copy.
 install_skills_to_homes() {
   skill_src="$1"
   root="${HOME}"
+  agent_key="${AGENT}"
+
+  agent_skill_relpath() {
+    case "$1" in
+      agents) printf '%s\n' ".agents/skills" ;;
+      openclaw) printf '%s\n' ".openclaw/skills" ;;
+      claude) printf '%s\n' ".claude/skills" ;;
+      cursor) printf '%s\n' ".cursor/skills" ;;
+      gemini) printf '%s\n' ".gemini/skills" ;;
+      codex) printf '%s\n' ".codex/skills" ;;
+      github) printf '%s\n' ".github/skills" ;;
+      windsurf) printf '%s\n' ".windsurf/skills" ;;
+      augment) printf '%s\n' ".augment/skills" ;;
+      cline) printf '%s\n' ".cline/skills" ;;
+      amp) printf '%s\n' ".amp/skills" ;;
+      kiro) printf '%s\n' ".kiro/skills" ;;
+      trae) printf '%s\n' ".trae/skills" ;;
+      hermes) printf '%s\n' ".hermes/skills" ;;
+      all) printf '%s\n' "all" ;;
+      *)
+        err "Unknown DWS_AGENT=$1 (use agents|openclaw|claude|cursor|...|all)"
+        ;;
+    esac
+  }
+
+  relpath="$(agent_skill_relpath "$agent_key")"
+  if [ "$relpath" != "all" ]; then
+    dest="$root/$relpath/$SKILL_NAME"
+    case "$root" in
+      "$HOME") label="~/$relpath/$SKILL_NAME" ;;
+      *) label="$root/$relpath/$SKILL_NAME" ;;
+    esac
+    _copy_skill "$skill_src" "$dest" "$label"
+    return 0
+  fi
+
   installed=0
   idx=0
   for agent_dir in \
