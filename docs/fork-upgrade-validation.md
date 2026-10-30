@@ -22,6 +22,9 @@ Environment: Windows amd64, Go 1.26.7, `CGO_ENABLED=0`,
   upstream LF bytes for this check, without changing their Git content.
   The optional protobuf regeneration check was skipped because libprotoc
   35.1 is not installed.
+- `scripts/policy/check-schema-catalog.sh`: passed for 33 products and 1540
+  tools, including runtime confirmation homology and selected CLI, helper,
+  homology and app tests.
 
 ## Full-suite limits
 
