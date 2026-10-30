@@ -40,11 +40,13 @@ rather than modifying upstream product skills:
 
 ## Follow-up and release boundary
 
-An optional expected-identity login guard is a separate change on this baseline.
-It must compare both organization and user identities after authoritative
-identity enrichment and before persisting the new credential, for OAuth and
-device flows. Missing identity must fail closed; historical Profile names are
-not proof of the scanning user. Legacy MCP login skipped this check.
+The follow-up change provides an optional
+[`auth login --expect-identity corpId:userId`](expected-login-identity.md) guard
+for first and subsequent authorization. It compares organization and user
+identities after authoritative identity enrichment and before persisting the
+new credential, for OAuth and device flows. Missing identity fails closed;
+historical Profile names are not proof of the scanning user. Legacy MCP login
+skipped this check.
 
 This baseline PR does not deploy a binary, change a connector, migrate tokens,
 or advance a deployment repository's gitlink. Those are separate integration
@@ -53,7 +55,7 @@ must not be treated as a drop-in replacement for the old sender-id CLI.
 
 ## Verification
 
-The baseline's tracked files, excluding this document, exactly match upstream
+The baseline merge's tracked files, excluding this document, exactly match upstream
 `v1.0.66`. Use `git diff v1.0.66 -- . ':!docs/FORK_UPGRADE.md'` with a locally
 available tag (or its pinned commit) to verify. This proves merge resolution,
 not end-to-end integration or platform support.
