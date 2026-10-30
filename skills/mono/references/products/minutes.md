@@ -1904,7 +1904,7 @@ dws minutes list mine --query "技术方案" --format json
 
 loop:
   调用 get transcription --id <uuid> [--next-token 当前token]
-  
+
   if stdout 为空 or 返回无效:
     if 当前token == 上一次token:
       连续空响应计数 += 1
@@ -1915,18 +1915,18 @@ loop:
       连续空响应计数 = 1
     上一次token = 当前token
     continue
-  
+
   连续空响应计数 = 0
   拼合本页转写文本到已累积文本
-  
+
   if len(已累积文本) > 12000:
     暂停翻页
     询问用户："当前已拉取约 N 字符，已达上限，是否继续？"
     if 用户拒绝: break
-  
+
   if 返回中无 nextToken 或 nextToken 为空:
     break（最后一页）
-  
+
   上一次token = 当前token
   当前token = 返回的 nextToken
 ```

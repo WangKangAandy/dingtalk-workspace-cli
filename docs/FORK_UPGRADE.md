@@ -53,7 +53,16 @@ must not be treated as a drop-in replacement for the old sender-id CLI.
 
 ## Verification
 
-The baseline's tracked files, excluding this document, exactly match upstream
-`v1.0.66`. Use `git diff v1.0.66 -- . ':!docs/FORK_UPGRADE.md'` with a locally
-available tag (or its pinned commit) to verify. This proves merge resolution,
-not end-to-end integration or platform support.
+The original baseline merge (`2e4649a6`) matches upstream `v1.0.66`, except
+for this document. A subsequent CI repair normalizes whitespace in eight
+upstream documentation/skill/script files and adapts the release-policy checks
+for this one-time import. Runtime Go code still matches the upstream baseline.
+
+The import policy pins both the old fork base and the upstream commit, requires
+both histories to remain ancestors, and checks that `CHANGELOG.md` and the
+entire `.changes` tree are identical to upstream, including file modes. It
+does not grant the changelog-only fast path. Later PRs and any changed release
+metadata use the ordinary release rules. Policy tests cover rejected imports.
+
+Use `git diff f215043e676d6889e1ddce3464828d8b1ec40c31` to inspect all fork
+differences. These checks do not prove end-to-end integration or platform support.
