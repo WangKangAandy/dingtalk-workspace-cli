@@ -45,6 +45,7 @@ import (
 )
 
 type authLoginConfig struct {
+	ExpectedIdentity               authExpectedIdentity
 	Token                          string
 	Force                          bool
 	Device                         bool
@@ -151,6 +152,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
   dws auth login --intl --pre-url https://pre-mcp.dingtalk.io
   dws auth login --recommend  # 无交互批量授权服务端推荐权限
   dws auth login --device     # SSH 远程 / 无头环境登录 (设备流)
+  dws auth login --device --expect-identity <corpId>:<userId> # 保存前校验授权者，支持首次登录
   dws auth login --force      # 兼容保留；login 默认已忽略缓存并进入授权流程
   dws auth login --token xxx  # 使用指定 token`,
 		DisableAutoGenTag: true,
@@ -207,14 +209,14 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					provider.SetLoginRegion(authpkg.LoginRegionInternational)
 				}
 				provider.IdentityEnricher = func(ctx context.Context, data *authpkg.TokenData) error {
-					return enrichAuthLoginProfileFromContact(ctx, configDir, patCaller, data, authLoginHistoryHint{
+					return enrichExpectedAuthLoginIdentity(ctx, configDir, patCaller, data, cfg.ExpectedIdentity, authLoginHistoryHint{
 						Selector: cfg.HistoryProfileSelector,
 						Explicit: cfg.HistoryProfileSelectorExplicit,
 					})
 				}
 				tokenData, err = authDeviceLogin(provider, loginCtx)
 				if err != nil {
-					return authLoginFlowError("device authorization failed", err)
+					return cfg.ExpectedIdentity.flowError("device authorization failed", err)
 				}
 			default:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.OAuthFlowTimeout)
@@ -228,7 +230,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 					provider.LoginRegion = authpkg.LoginRegionInternational
 				}
 				provider.IdentityEnricher = func(ctx context.Context, data *authpkg.TokenData) error {
-					return enrichAuthLoginProfileFromContact(ctx, configDir, patCaller, data, authLoginHistoryHint{
+					return enrichExpectedAuthLoginIdentity(ctx, configDir, patCaller, data, cfg.ExpectedIdentity, authLoginHistoryHint{
 						Selector: cfg.HistoryProfileSelector,
 						Explicit: cfg.HistoryProfileSelectorExplicit,
 					})
@@ -236,7 +238,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				configureOAuthProviderCompatibility(provider, configDir)
 				tokenData, err = authOAuthLogin(provider, loginCtx, authLoginForcesAuthorization(cfg))
 				if err != nil {
-					return authLoginFlowError("dingtalk login failed", err)
+					return cfg.ExpectedIdentity.flowError("dingtalk login failed", err)
 				}
 			}
 
@@ -326,6 +328,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 		},
 	}
 	cmd.Flags().String("token", "", "Access token")
+	cmd.Flags().String("expect-identity", "", "Require the authenticated corpId:userId before saving; supports first login; cannot combine with --profile or --token")
 	cmd.Flags().Bool("device", false, "Use device authorization flow")
 	cmd.Flags().Bool("intl", false, "Use DingTalk international (.io) login and service endpoints")
 	cmd.Flags().Bool("international", false, "Use DingTalk international (.io) login and service endpoints")
@@ -1294,9 +1297,16 @@ func resolveAuthLoginConfig(cmd *cobra.Command) (authLoginConfig, error) {
 		yes, _ = cmd.Root().PersistentFlags().GetBool("yes")
 		profileSelector, _ = cmd.Root().PersistentFlags().GetString("profile")
 	}
+	expected, err := resolveExpectedAuthLoginIdentity(cmd, token, profileSelector)
+	if err != nil {
+		return authLoginConfig{}, err
+	}
 	targetCorpID, historyProfileSelector, historyProfileSelectorExplicit, err := resolveAuthLoginTarget(defaultConfigDir(), profileSelector)
 	if err != nil {
 		return authLoginConfig{}, err
+	}
+	if expected.corpID != "" {
+		targetCorpID = expected.corpID
 	}
 	flow := "oauth"
 	if strings.TrimSpace(token) != "" {
@@ -1313,6 +1323,7 @@ func resolveAuthLoginConfig(cmd *cobra.Command) (authLoginConfig, error) {
 		"recommend", recommend,
 	)
 	return authLoginConfig{
+		ExpectedIdentity:               expected,
 		Token:                          strings.TrimSpace(token),
 		Force:                          force,
 		Device:                         device,
