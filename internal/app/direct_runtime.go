@@ -16,14 +16,13 @@ package app
 import (
 	"net"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/market"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/mcptypes"
 )
 
 var (
@@ -45,14 +44,40 @@ const (
 	defaultPATProductID   = "pat"
 	defaultPATDisplayName = "行为授权"
 	defaultPATServerID    = "abc3c880fb90f04b52d1426aaf093766e5fc9ec38411688cbb74df42a584d374"
+	devappProductID       = "devapp"
+	devappServerPath      = "/server/op-app"
+	deapDevProductID      = "deap-dev"
+	deapDevServerPath     = "/server/68e7e41374caa1336dc642bc3dd220de6f1e7077356dc0d4fc128f62d52d7d9b"
+	mcpdevProductID       = "mcpdev"
+	mcpdevServerPath      = "/server/62445d67b5b7971653fbd0f7c8092ee3b9ca59ce51a15ad0a1e0c0d7aac4ede5"
 )
 
-func defaultPATServerDescriptor() market.ServerDescriptor {
-	return market.ServerDescriptor{
+// devappMCPEndpoint resolves the open-platform app-management MCP endpoint
+// from the configured gateway base URL, so it follows the active environment
+// (production by default, pre when ~/.dws/mcp_url points at the pre gateway).
+func devappMCPEndpoint() string {
+	return defaultPATGatewayBaseURL() + devappServerPath
+}
+
+// deapDevMCPEndpoint resolves the DEAP developer MCP endpoint from the same
+// configured gateway base URL used by other built-in direct-runtime products.
+func deapDevMCPEndpoint() string {
+	return defaultPATGatewayBaseURL() + deapDevServerPath
+}
+
+// mcpdevMCPEndpoint resolves the MCP development scaffold endpoint. It follows
+// the configured gateway base URL rather than pinning one environment, matching
+// devapp; the server path is the same registration on both gateways.
+func mcpdevMCPEndpoint() string {
+	return defaultPATGatewayBaseURL() + mcpdevServerPath
+}
+
+func defaultPATServerDescriptor() mcptypes.ServerDescriptor {
+	return mcptypes.ServerDescriptor{
 		Key:         defaultPATProductID,
 		DisplayName: defaultPATDisplayName,
 		Endpoint:    defaultPATMCPEndpoint(),
-		CLI: market.CLIOverlay{
+		CLI: mcptypes.CLIOverlay{
 			ID:       defaultPATProductID,
 			Command:  defaultPATProductID,
 			Prefixes: []string{defaultPATProductID},
@@ -66,6 +91,20 @@ func defaultPATMCPEndpoint() string {
 
 func defaultPATGatewayBaseURL() string {
 	raw := strings.TrimSpace(authpkg.GetMCPBaseURL())
+	return mcpGatewayBaseURL(raw)
+}
+
+func defaultPATGatewayBaseURLForLoginRegion(region authpkg.LoginRegion) string {
+	raw := strings.TrimSpace(authpkg.GetMCPBaseURL())
+	if override := authpkg.MCPBaseURLOverride(); override != "" {
+		raw = override
+	} else {
+		raw = mcpBaseURLForLoginRegion(raw, region)
+	}
+	return mcpGatewayBaseURL(raw)
+}
+
+func mcpGatewayBaseURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return strings.TrimRight(raw, "/")
@@ -92,9 +131,36 @@ func defaultPATGatewayBaseURL() string {
 	return strings.TrimRight(parsed.String(), "/")
 }
 
+func mcpBaseURLForLoginRegion(raw string, region authpkg.LoginRegion) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return raw
+	}
+	host := strings.ToLower(parsed.Hostname())
+	fromSuffix, toSuffix := ".dingtalk.io", ".dingtalk.com"
+	if region.IsInternational() {
+		fromSuffix, toSuffix = toSuffix, fromSuffix
+	}
+	bareFrom := strings.TrimPrefix(fromSuffix, ".")
+	if host != bareFrom && !strings.HasSuffix(host, fromSuffix) {
+		return raw
+	}
+	if host == bareFrom {
+		host = strings.TrimPrefix(toSuffix, ".")
+	} else {
+		host = strings.TrimSuffix(host, fromSuffix) + toSuffix
+	}
+	if port := parsed.Port(); port != "" {
+		parsed.Host = net.JoinHostPort(host, port)
+	} else {
+		parsed.Host = host
+	}
+	return parsed.String()
+}
+
 // SetDynamicServers injects server data discovered from servers.json.
 // All product endpoints are resolved dynamically from this data.
-func SetDynamicServers(servers []market.ServerDescriptor) {
+func SetDynamicServers(servers []mcptypes.ServerDescriptor) {
 	dynamicMu.Lock()
 	defer dynamicMu.Unlock()
 
@@ -102,54 +168,9 @@ func SetDynamicServers(servers []market.ServerDescriptor) {
 	products := make(map[string]bool)
 	aliases := make(map[string]string)
 	toolEndpoints := make(map[string]string)
-	registerDynamicServer(defaultPATServerDescriptor(), endpoints, products, aliases, toolEndpoints)
+	registerDynamicServer(defaultPATServerDescriptor(), endpoints, products, aliases, toolEndpoints, false)
 	for _, server := range servers {
-		if server.CLI.Skip {
-			continue
-		}
-		id := strings.TrimSpace(server.CLI.ID)
-		endpoint := strings.TrimSpace(server.Endpoint)
-		if id != "" && endpoint != "" {
-			endpoints[id] = endpoint
-			products[id] = true
-		}
-		cmd := strings.TrimSpace(server.CLI.Command)
-		if cmd != "" && cmd != id && endpoint != "" {
-			endpoints[cmd] = endpoint
-			products[cmd] = true
-		}
-		for _, alias := range server.CLI.Aliases {
-			alias = strings.TrimSpace(alias)
-			if alias != "" && endpoint != "" {
-				endpoints[alias] = endpoint
-				products[alias] = true
-				// Build alias → CLI.ID mapping
-				aliases[alias] = id
-			}
-		}
-		// Build tool → endpoint mapping from CLI tools and overrides.
-		if endpoint != "" {
-			for _, tool := range server.CLI.Tools {
-				toolName := strings.TrimSpace(tool.Name)
-				if toolName != "" {
-					toolEndpoints[toolName] = endpoint
-				}
-			}
-			for toolName, override := range server.CLI.ToolOverrides {
-				toolName = strings.TrimSpace(toolName)
-				if toolName == "" {
-					continue
-				}
-				// Leaves with serverOverride are routed to a different server's
-				// endpoint (e.g. chat's "search_my_robots" → bot). Registering
-				// them here would overwrite the real owner's tool → endpoint
-				// mapping and send the invocation to the wrong MCP URL.
-				if strings.TrimSpace(override.ServerOverride) != "" {
-					continue
-				}
-				toolEndpoints[toolName] = endpoint
-			}
-		}
+		registerDynamicServer(server, endpoints, products, aliases, toolEndpoints, false)
 	}
 	dynamicEndpoints = endpoints
 	dynamicProducts = products
@@ -157,19 +178,31 @@ func SetDynamicServers(servers []market.ServerDescriptor) {
 	dynamicToolEndpoints = toolEndpoints
 }
 
-func registerDynamicServer(server market.ServerDescriptor, endpoints map[string]string, products map[string]bool, aliases map[string]string, toolEndpoints map[string]string) {
+// registerDynamicServer is the shared dynamic-server registration core used by
+// SetDynamicServers and AppendDynamicServer. It records the descriptor's
+// endpoint under its ID, command name, and aliases, and builds the tool →
+// endpoint map from its CLI tools and overrides. With protectCommandKey=true
+// (AppendDynamicServer) an already-registered command-key endpoint is never
+// overwritten; with false the entry is replaced.
+func registerDynamicServer(server mcptypes.ServerDescriptor, endpoints map[string]string, products map[string]bool, aliases map[string]string, toolEndpoints map[string]string, protectCommandKey bool) {
 	if server.CLI.Skip {
 		return
 	}
 	id := strings.TrimSpace(server.CLI.ID)
-	endpoint := strings.TrimSpace(server.Endpoint)
+	endpoint := activeDingTalkGatewayEndpoint(server.Endpoint)
 	if id != "" && endpoint != "" {
 		endpoints[id] = endpoint
 		products[id] = true
 	}
 	cmd := strings.TrimSpace(server.CLI.Command)
 	if cmd != "" && cmd != id && endpoint != "" {
-		endpoints[cmd] = endpoint
+		if protectCommandKey {
+			if _, exists := endpoints[cmd]; !exists {
+				endpoints[cmd] = endpoint
+			}
+		} else {
+			endpoints[cmd] = endpoint
+		}
 		products[cmd] = true
 	}
 	for _, alias := range server.CLI.Aliases {
@@ -177,11 +210,11 @@ func registerDynamicServer(server market.ServerDescriptor, endpoints map[string]
 		if alias != "" && endpoint != "" {
 			endpoints[alias] = endpoint
 			products[alias] = true
-			// Build alias -> CLI.ID mapping.
+			// Build alias → CLI.ID mapping.
 			aliases[alias] = id
 		}
 	}
-	// Build tool -> endpoint mapping from CLI tools and overrides.
+	// Build tool → endpoint mapping from CLI tools and overrides.
 	if endpoint != "" {
 		for _, tool := range server.CLI.Tools {
 			toolName := strings.TrimSpace(tool.Name)
@@ -189,44 +222,35 @@ func registerDynamicServer(server market.ServerDescriptor, endpoints map[string]
 				toolEndpoints[toolName] = endpoint
 			}
 		}
-		for toolName := range server.CLI.ToolOverrides {
+		for toolName, override := range server.CLI.ToolOverrides {
 			toolName = strings.TrimSpace(toolName)
-			if toolName != "" {
-				toolEndpoints[toolName] = endpoint
+			if toolName == "" {
+				continue
 			}
+			// Leaves with serverOverride are routed to a different server's
+			// endpoint (e.g. chat's "search_my_robots" → bot). Registering
+			// them here would overwrite the real owner's tool → endpoint
+			// mapping and send the invocation to the wrong MCP URL.
+			if strings.TrimSpace(override.ServerOverride) != "" {
+				continue
+			}
+			toolEndpoints[toolName] = endpoint
 		}
 	}
 }
 
+// shouldUseDirectRuntime gates endpoint resolution to the only invocation
+// kinds the executor constructs: compat_invocation via
+// NewCompatibilityInvocation and helper_invocation via NewHelperInvocation.
+// Every other kind skips direct-runtime resolution and terminates at
+// handleCatalogMiss in the runner.
 func shouldUseDirectRuntime(invocation executor.Invocation) bool {
-	if strings.TrimSpace(os.Getenv(cli.CatalogFixtureEnv)) != "" {
-		return false
-	}
 	switch invocation.Kind {
 	case "compat_invocation", "helper_invocation":
 		return true
 	default:
 		return false
 	}
-}
-
-// directRuntimeToolEndpoint returns the MCP endpoint owned by the server
-// whose toolOverrides registered this tool name. Used to correct catalog
-// lookups when two envelope servers share the same cli.command and the
-// per-product endpoint map collides (see runner.go cross-check).
-func directRuntimeToolEndpoint(toolName string) (string, bool) {
-	toolName = strings.TrimSpace(toolName)
-	if toolName == "" {
-		return "", false
-	}
-	dynamicMu.RLock()
-	te := dynamicToolEndpoints
-	dynamicMu.RUnlock()
-	if te == nil {
-		return "", false
-	}
-	endpoint, ok := te[toolName]
-	return endpoint, ok && strings.TrimSpace(endpoint) != ""
 }
 
 func directRuntimeEndpoint(productID, toolName string) (string, bool) {
@@ -241,24 +265,32 @@ func directRuntimeEndpoint(productID, toolName string) (string, bool) {
 		}
 	}
 
-	dynamicMu.RLock()
-	de := dynamicEndpoints
-	te := dynamicToolEndpoints
-	dynamicMu.RUnlock()
+	// Hardcoded built-ins are helper-only products pinned to
+	// their MCP servers in source (NOT service discovery), per product decision.
+	for _, candidate := range []string{strings.TrimSpace(productID), normalized} {
+		switch candidate {
+		case devappProductID:
+			return devappMCPEndpoint(), true
+		case deapDevProductID:
+			return deapDevMCPEndpoint(), true
+		case mcpdevProductID:
+			return mcpdevMCPEndpoint(), true
+		}
+	}
 
 	// Priority 1: product-level endpoint.
 	// When the caller already knows the productID (e.g. "drive"), the product
 	// endpoint is authoritative. This prevents cross-product tool name
 	// collisions (e.g. both "drive" and "doc" register "create_folder") from
 	// routing the request to the wrong MCP server. See issue #219.
+	dynamicMu.RLock()
 	for _, candidate := range []string{strings.TrimSpace(productID), normalized} {
 		if candidate == "" {
 			continue
 		}
-		if de != nil {
-			if endpoint, ok := de[candidate]; ok {
-				return endpoint, true
-			}
+		if endpoint, ok := dynamicEndpoints[candidate]; ok {
+			dynamicMu.RUnlock()
+			return endpoint, true
 		}
 	}
 
@@ -266,11 +298,13 @@ func directRuntimeEndpoint(productID, toolName string) (string, bool) {
 	// This path is used when the caller does not know the productID but has a
 	// tool name, e.g. in helper invocations or plugin routes where only the
 	// tool name is available.
-	if tool := strings.TrimSpace(toolName); tool != "" && te != nil {
-		if endpoint, ok := te[tool]; ok {
+	if tool := strings.TrimSpace(toolName); tool != "" {
+		if endpoint, ok := dynamicToolEndpoints[tool]; ok {
+			dynamicMu.RUnlock()
 			return endpoint, true
 		}
 	}
+	dynamicMu.RUnlock()
 
 	// Priority 3: built-in PAT fallback for cold-start paths that run before
 	// discovery/plugin registration has populated the dynamic registry.
@@ -279,18 +313,121 @@ func directRuntimeEndpoint(productID, toolName string) (string, bool) {
 			return defaultPATMCPEndpoint(), true
 		}
 	}
+
+	// Priority 4: edition-owned static/supplement endpoints. Helper-only
+	// products such as devapp intentionally do not depend on Market discovery,
+	// so the internal edition may provide only an endpoint and no tool list.
+	for _, candidate := range []string{strings.TrimSpace(productID), normalized} {
+		if endpoint, ok := editionServerEndpoint(candidate); ok {
+			return endpoint, true
+		}
+	}
 	return "", false
 }
 
-// DirectRuntimeProductIDs returns the set of product IDs that have direct
-// runtime endpoints configured, sourced from dynamic server discovery.
+func hasDirectRuntimeEndpointOverride(productID string) bool {
+	normalized := normalizeDirectRuntimeProductID(productID)
+	for _, candidate := range []string{strings.TrimSpace(productID), normalized} {
+		if candidate == "" {
+			continue
+		}
+		if _, ok := productEndpointOverride(candidate); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func editionServerEndpoint(productID string) (string, bool) {
+	productID = strings.TrimSpace(productID)
+	if productID == "" {
+		return "", false
+	}
+	hooks := edition.Get()
+	if endpoint, ok := endpointFromEditionServers(productID, hooks.StaticServers); ok {
+		return endpoint, true
+	}
+	if endpoint, ok := endpointFromEditionServers(productID, hooks.SupplementServers); ok {
+		return endpoint, true
+	}
+	return "", false
+}
+
+func endpointFromEditionServers(productID string, fn func() []edition.ServerInfo) (string, bool) {
+	if fn == nil {
+		return "", false
+	}
+	for _, server := range fn() {
+		endpoint := activeDingTalkGatewayEndpoint(server.Endpoint)
+		if endpoint == "" {
+			continue
+		}
+		if strings.TrimSpace(server.ID) == productID {
+			return endpoint, true
+		}
+		for _, prefix := range server.Prefixes {
+			if strings.TrimSpace(prefix) == productID {
+				return endpoint, true
+			}
+		}
+	}
+	return "", false
+}
+
+func activeDingTalkGatewayEndpoint(endpoint string) string {
+	return activeDingTalkGatewayEndpointWithBase(endpoint, defaultPATGatewayBaseURL())
+}
+
+func activeDingTalkGatewayEndpointForLoginRegion(endpoint string, region authpkg.LoginRegion) string {
+	return activeDingTalkGatewayEndpointWithBase(endpoint, defaultPATGatewayBaseURLForLoginRegion(region))
+}
+
+func activeDingTalkGatewayEndpointWithBase(endpoint, gatewayBaseURL string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return endpoint
+	}
+	if !isDingTalkMCPGatewayHost(parsed.Hostname()) {
+		return endpoint
+	}
+	base, err := url.Parse(gatewayBaseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return endpoint
+	}
+	parsed.Scheme = base.Scheme
+	parsed.Host = base.Host
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func isDingTalkMCPGatewayHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "mcp-gw.dingtalk.com", "pre-mcp-gw.dingtalk.com", "mcp-gw.dingtalk.io", "pre-mcp-gw.dingtalk.io":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDingTalkMCPGatewayEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	return err == nil && isDingTalkMCPGatewayHost(parsed.Hostname())
+}
+
+// DirectRuntimeProductIDs returns product IDs that should stay visible for
+// direct runtime execution. Dynamic products come from MCP discovery/plugin
+// registration; built-in helper products such as devapp resolve their endpoint
+// through DINGTALK_<PRODUCT>_MCP_URL instead of requiring discovery.
 func DirectRuntimeProductIDs() map[string]bool {
 	dynamicMu.RLock()
-	dp := dynamicProducts
-	dynamicMu.RUnlock()
-	ids := make(map[string]bool, len(dp)+1)
+	defer dynamicMu.RUnlock()
+
+	ids := make(map[string]bool, len(dynamicProducts)+5)
 	ids[defaultPATProductID] = true
-	for key := range dp {
+	ids[devappProductID] = true
+	ids[deapDevProductID] = true
+	ids[mcpdevProductID] = true
+	for key := range dynamicProducts {
 		ids[key] = true
 	}
 	return ids
@@ -300,7 +437,7 @@ func DirectRuntimeProductIDs() map[string]bool {
 // dynamic server registry without replacing the current entries. This
 // is used by the plugin loader to inject plugin servers alongside
 // Market-discovered servers.
-func AppendDynamicServer(server market.ServerDescriptor) {
+func AppendDynamicServer(server mcptypes.ServerDescriptor) {
 	dynamicMu.Lock()
 	defer dynamicMu.Unlock()
 
@@ -317,63 +454,18 @@ func AppendDynamicServer(server market.ServerDescriptor) {
 		dynamicToolEndpoints = make(map[string]string)
 	}
 
-	if server.CLI.Skip {
-		return
-	}
-
-	id := strings.TrimSpace(server.CLI.ID)
-	endpoint := strings.TrimSpace(server.Endpoint)
-	if id != "" && endpoint != "" {
-		dynamicEndpoints[id] = endpoint
-		dynamicProducts[id] = true
-	}
-	cmd := strings.TrimSpace(server.CLI.Command)
-	if cmd != "" && cmd != id && endpoint != "" {
-		if _, exists := dynamicEndpoints[cmd]; !exists {
-			dynamicEndpoints[cmd] = endpoint
-		}
-		dynamicProducts[cmd] = true
-	}
-	for _, alias := range server.CLI.Aliases {
-		alias = strings.TrimSpace(alias)
-		if alias != "" && endpoint != "" {
-			dynamicEndpoints[alias] = endpoint
-			dynamicProducts[alias] = true
-			dynamicAliases[alias] = id
-		}
-	}
-	if endpoint != "" {
-		for _, tool := range server.CLI.Tools {
-			toolName := strings.TrimSpace(tool.Name)
-			if toolName != "" {
-				dynamicToolEndpoints[toolName] = endpoint
-			}
-		}
-		for toolName, override := range server.CLI.ToolOverrides {
-			toolName = strings.TrimSpace(toolName)
-			if toolName == "" {
-				continue
-			}
-			// Leaves with serverOverride are routed to a different server's
-			// endpoint; skip to avoid overwriting the real owner's mapping.
-			if strings.TrimSpace(override.ServerOverride) != "" {
-				continue
-			}
-			dynamicToolEndpoints[toolName] = endpoint
-		}
-	}
+	registerDynamicServer(server, dynamicEndpoints, dynamicProducts, dynamicAliases, dynamicToolEndpoints, true)
 }
 
 func normalizeDirectRuntimeProductID(productID string) string {
-	dynamicMu.RLock()
-	da := dynamicAliases
-	dynamicMu.RUnlock()
 	trimmed := strings.TrimSpace(productID)
-	if da != nil {
-		if normalizedID, ok := da[trimmed]; ok && normalizedID != "" {
-			return normalizedID
-		}
+	dynamicMu.RLock()
+	if normalizedID, ok := dynamicAliases[trimmed]; ok && normalizedID != "" {
+		dynamicMu.RUnlock()
+		return normalizedID
 	}
+	dynamicMu.RUnlock()
+
 	if normalizedID, ok := legacyDirectRuntimeAliases[trimmed]; ok {
 		return normalizedID
 	}

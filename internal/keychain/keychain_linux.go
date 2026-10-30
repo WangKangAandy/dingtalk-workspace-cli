@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux
+//go:build linux || openharmony
 
 package keychain
 
@@ -30,6 +30,10 @@ import (
 // getDEK retrieves or generates the Data Encryption Key from local file.
 func getDEK(service string) ([]byte, error) {
 	return fileDEK(service)
+}
+
+func getDEKReadOnly(service string) ([]byte, error) {
+	return fileDEKReadOnly(service)
 }
 
 const (
@@ -62,11 +66,15 @@ func safeFileName(account string) string {
 }
 
 func encryptData(plaintext string, key []byte) ([]byte, error) {
+	return encryptDataWithGCM(plaintext, key, cipher.NewGCM)
+}
+
+func encryptDataWithGCM(plaintext string, key []byte, newGCM keychainGCMFactory) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	aesGCM, err := cipher.NewGCM(block)
+	aesGCM, err := newGCM(block)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +92,10 @@ func encryptData(plaintext string, key []byte) ([]byte, error) {
 }
 
 func decryptData(data []byte, key []byte) (string, error) {
+	return decryptDataWithGCM(data, key, cipher.NewGCM)
+}
+
+func decryptDataWithGCM(data []byte, key []byte, newGCM keychainGCMFactory) (string, error) {
 	if len(data) < ivBytes+tagBytes {
 		return "", fmt.Errorf("ciphertext too short")
 	}
@@ -91,7 +103,7 @@ func decryptData(data []byte, key []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	aesGCM, err := cipher.NewGCM(block)
+	aesGCM, err := newGCM(block)
 	if err != nil {
 		return "", err
 	}
@@ -106,10 +118,6 @@ func decryptData(data []byte, key []byte) (string, error) {
 }
 
 func platformGet(service, account string) (string, error) {
-	key, err := getDEK(service)
-	if err != nil {
-		return "", err
-	}
 	data, err := os.ReadFile(filepath.Join(StorageDir(service), safeFileName(account)))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -117,9 +125,13 @@ func platformGet(service, account string) (string, error) {
 		}
 		return "", err
 	}
-	plaintext, err := decryptData(data, key)
+	key, err := getDEKReadOnly(service)
 	if err != nil {
 		return "", err
+	}
+	plaintext, err := decryptData(data, key)
+	if err != nil {
+		return "", fileDEKCiphertextMismatchError()
 	}
 	return plaintext, nil
 }
@@ -149,6 +161,27 @@ func platformSet(service, account, data string) error {
 	// Atomic rename to prevent file corruption during multi-process writes
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return err
+	}
+	return nil
+}
+
+func platformValidateAuthTokenEntries(service string) error {
+	paths, err := authTokenCiphertextPaths(service)
+	if err != nil || len(paths) == 0 {
+		return err
+	}
+	key, err := getDEKReadOnly(service)
+	if err != nil {
+		return fmt.Errorf("read DEK for auth token validation: %w", err)
+	}
+	for _, path := range paths {
+		ciphertext, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read keychain entry %q: %w", filepath.Base(path), err)
+		}
+		if _, err := decryptData(ciphertext, key); err != nil {
+			return fmt.Errorf("validate keychain entry %q: %w", filepath.Base(path), fileDEKCiphertextMismatchError())
+		}
 	}
 	return nil
 }

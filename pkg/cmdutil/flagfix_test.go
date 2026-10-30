@@ -14,11 +14,55 @@
 package cmdutil
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 )
+
+func TestCrossPlatformCoverageFlagFixLocalCorrection(t *testing.T) {
+	cmd := &cobra.Command{Use: "list"}
+	cmd.Flags().String("start", "", "begin time")
+	_ = cmd.Flags().SetAnnotation("start", "x-cli-format", []string{"date-time"})
+	cmd.Flags().Bool("yes", false, "confirm")
+	cmd.Flags().String("conversation-id", "", "Conversation id")
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "common alias", err: errUnknownFlag("json"), want: true},
+		{name: "glued value", err: errUnknownFlag("start2026-02-07"), want: true},
+		{name: "glued boolean", err: errUnknownFlag("yesfalse"), want: true},
+		{name: "near candidate", err: errUnknownFlag("conversaton-id"), want: true},
+		{name: "help only", err: errUnknownFlag("entirely-new-capability")},
+		{name: "false glue", err: errUnknownFlag("starttime1")},
+		{name: "not unknown", err: errors.New("invalid flag value")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fix := SuggestFlagFix(cmd, test.err)
+			if fix.HasCorrection != test.want {
+				t.Fatalf("HasCorrection=%v, want %v; hint=%q", fix.HasCorrection, test.want, fix.Suggestion)
+			}
+			if test.want && fix.Suggestion == "" {
+				t.Fatal("correction must carry its existing hint")
+			}
+			wire, err := json.Marshal(fix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if len(fields) != 3 || fields["Suggestion"] != fix.Suggestion || fields["AutoFixFlag"] != fix.AutoFixFlag || fields["AutoFixValue"] != fix.AutoFixValue {
+				t.Fatalf("local correction fact changed public JSON: %s", wire)
+			}
+		})
+	}
+}
 
 func TestSuggestFlagFix_falseGlue_starttime1(t *testing.T) {
 	cmd := &cobra.Command{Use: "list"}
@@ -51,6 +95,28 @@ func TestSuggestFlagFix_trueGlue_isoDateSuffix(t *testing.T) {
 	}
 	if fix.AutoFixFlag != "start" || fix.AutoFixValue != "2026-02-07" {
 		t.Fatalf("AutoFix = %q/%q, want start/2026-02-07", fix.AutoFixFlag, fix.AutoFixValue)
+	}
+}
+
+func TestSuggestFlagFix_boolGlueNeverAutoFixes(t *testing.T) {
+	cmd := &cobra.Command{Use: "delete"}
+	cmd.Flags().Bool("yes", false, "confirm destructive operation")
+
+	for _, test := range []struct {
+		body string
+		want string
+	}{
+		{body: "yesfalse", want: "--yes=false"},
+		{body: "yestrue", want: "--yes=true"},
+		{body: "yesno", want: "--yes=false"},
+	} {
+		fix := SuggestFlagFix(cmd, errUnknownFlag(test.body))
+		if fix.AutoFixFlag != "" || fix.AutoFixValue != "" {
+			t.Fatalf("SuggestFlagFix(%q) auto-fix = %q/%q, want none", test.body, fix.AutoFixFlag, fix.AutoFixValue)
+		}
+		if strings.Contains(fix.Suggestion, "Space required") || !strings.Contains(fix.Suggestion, test.want) {
+			t.Fatalf("SuggestFlagFix(%q) suggestion = %q, want safe inline %q", test.body, fix.Suggestion, test.want)
+		}
 	}
 }
 

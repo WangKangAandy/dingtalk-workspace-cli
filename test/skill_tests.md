@@ -39,22 +39,25 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 | 产品 | Skill 参考文档 | 命令数 | 用例数 |
 |------|---------------|--------|--------|
-| `aitable` | `references/products/aitable.md` | 16 | 41 |
+| `aitable` | `references/products/aitable.md` | 16 | 49 |
 | `attendance` | `references/products/attendance.md` | 4 | 16 |
 | `calendar` | `references/products/calendar.md` | 13 | 30 |
 | `chat` | `references/products/chat.md` | 13 | 31 |
 | `contact` | `references/products/contact.md` | 7 | 14 |
-| `devdoc` | `references/products/simple.md` | 1 | 5 |
+| `devdoc` | `references/products/simple.md` | 2 | 7 |
+| `dev` | `skills/multi/dingtalk-misc/references/devapp.md` | 19 | 25 |
 | `ding` | `references/products/ding.md` | 2 | 5 |
+| `event` | `skills/multi/dingtalk-event/SKILL.md` | 6 | 40 |
 | `report` | `references/products/report.md` | 6 | 26 |
+| `routing` | `references/intent-guide.md` | 1 | 3 |
 | `todo` | `references/products/todo.md` | 6 | 30 |
-| `workbench` | `references/products/workbench.md` | 2 | 4 |
+| `workbench` | `references/products/workbench.md` | 2 | 6 |
 
 ---
 
 ## 测试用例
 
-### aitable（41 条）
+### aitable（49 条）
 
 #### `dws aitable base create`
 
@@ -231,8 +234,8 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 **aitable_aitable_record_query_005**
 - Prompt: 查询 base123 的 table456 中的记录，按字段 fld1 降序排列
-- Expected: `dws aitable record query --base-id base123 --table-id table456 --sort '[{"fieldId":"fld1","order":"desc"}]' --format json`
-- Flags: `--base-id` = `base123`, `--sort` = `[{"fieldId":"fld1","order":"desc"}]`, `--table-id` = `table456`
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --sort '[{"fieldId":"fld1","direction":"desc"}]' --format json`
+- Flags: `--base-id` = `base123`, `--sort` = `[{"fieldId":"fld1","direction":"desc"}]`, `--table-id` = `table456`
 
 **aitable_aitable_record_query_006**
 - Prompt: 查询 base123 的 table456 中状态为进行中的记录
@@ -243,6 +246,47 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 - Prompt: 在 base123 的 table456 中搜索关键词 项目评审，只返回字段 fld1,fld2，每页10条
 - Expected: `dws aitable record query --base-id base123 --table-id table456 --keyword 项目评审 --limit 10 --field-ids fld1,fld2 --format json`
 - Flags: `--base-id` = `base123`, `--field-ids` = `fld1,fld2`, `--keyword` = `项目评审`, `--limit` = `10`, `--table-id` = `table456`
+
+**aitable_aitable_record_query_008**
+- Prompt: 完整拉取 base123 的 table456 所有记录用于汇总
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --all --page-limit 0 --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--all` = `true`, `--page-limit` = `0`
+
+**aitable_aitable_record_query_009**
+- Prompt: 上一页返回 records 为空但 nextCursor 为 cur2，继续查 base123/table456
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --cursor cur2 --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--cursor` = `cur2`
+
+**aitable_aitable_record_query_010**
+- Prompt: record query --all 由于 page-limit 截断，错误详情里 cursor 是 cur_resume，继续完整拉取
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --all --page-limit 0 --cursor cur_resume --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--all` = `true`, `--page-limit` = `0`, `--cursor` = `cur_resume`
+
+**aitable_aitable_record_query_011**
+- Prompt: 查询 base123/table456 状态为进行中，字段已解析为 fldStatus，选项 ID 为 optDoing
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --filters '{"operator":"and","operands":[{"operator":"eq","operands":["fldStatus","optDoing"]}]}' --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--filters` = `{"operator":"and","operands":[{"operator":"eq","operands":["fldStatus","optDoing"]}]}`
+
+**aitable_aitable_record_query_012**
+- Prompt: 查询负责人是张三的记录，张三已通过 aisearch 唯一解析为 userId staff123
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --filters '{"operator":"and","operands":[{"operator":"eq","operands":["fldOwner",[{"userId":"staff123"}]]}]}' --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--filters` = `{"operator":"and","operands":[{"operator":"eq","operands":["fldOwner",[{"userId":"staff123"}]]}]}`
+
+**aitable_aitable_record_query_013**
+- Prompt: 查询部门是研发部的记录，研发部已通过 contact +resolve-dept 唯一解析为 deptId 987
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --filters '{"operator":"and","operands":[{"operator":"eq","operands":["fldDept",[{"departmentId":"987"}]]}]}' --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--filters` = `{"operator":"and","operands":[{"operator":"eq","operands":["fldDept",[{"departmentId":"987"}]]}]}`
+
+**aitable_aitable_record_query_014**
+- Prompt: 查询关联客户为阿里巴巴的记录，客户记录已唯一解析为 recCustomer1
+- Expected: `dws aitable record query --base-id base123 --table-id table456 --filters '{"operator":"and","operands":[{"operator":"eq","operands":["fldCustomer","recCustomer1"]}]}' --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`, `--filters` = `{"operator":"and","operands":[{"operator":"eq","operands":["fldCustomer","recCustomer1"]}]}`
+
+**aitable_aitable_record_query_015**
+- Prompt: 查询 base123 的 table456 中优先级为高的记录，还不知道表里有哪些字段
+- Expected: `dws aitable field get --base-id base123 --table-id table456 --format json`
+- Flags: `--base-id` = `base123`, `--table-id` = `table456`
+- 说明: 查询指定数据前必须先完整读一遍表头，确定"优先级"对应的 fieldId 与类型后，再解析"高"并组装 filters
 
 #### `dws aitable table create`
 
@@ -267,6 +311,28 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 - Prompt: 删除 base123 中的数据表 table456，说明原因是该表已废弃
 - Expected: `dws aitable table delete --base-id base123 --table-id table456 --reason 该表已废弃 --format json`
 - Flags: `--base-id` = `base123`, `--reason` = `该表已废弃`, `--table-id` = `table456`
+
+#### `dws aitable psql`
+
+**aitable_aitable_psql_001**
+- Prompt: 查看 AI 表格 base123 里有哪些可以用 PostgreSQL 查询的数据表
+- Expected: `dws aitable psql --database base123 --list`
+- Flags: `--database` = `base123`, `--list` = `true`
+
+**aitable_aitable_psql_002**
+- Prompt: 查看 AI 表格 base123 中数据表 table456 的 SQL 字段结构和类型
+- Expected: `dws aitable psql --database base123 --table table456`
+- Flags: `--database` = `base123`, `--table` = `table456`
+
+**aitable_aitable_psql_003**
+- Prompt: 用 PostgreSQL 查询 AI 表格 base123 的数据表1前10条
+- Expected: `dws aitable psql --database base123 --command 'SELECT * FROM "数据表1" LIMIT 10'`
+- Flags: `--database` = `base123`, `--command` = `SELECT * FROM "数据表1" LIMIT 10`
+
+**aitable_aitable_psql_004**
+- Prompt: 用 LEFT JOIN 查询 AI 表格 base123，数据表1的业务名称等于数据表2的文本
+- Expected: `dws aitable psql --database base123 --command 'SELECT * FROM "数据表1" LEFT JOIN "数据表2" ON "数据表1"."业务名称" = "数据表2"."文本"'`
+- Flags: `--database` = `base123`, `--command` = `SELECT * FROM "数据表1" LEFT JOIN "数据表2" ON "数据表1"."业务名称" = "数据表2"."文本"`
 
 #### `dws aitable table get`
 
@@ -680,8 +746,8 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 **chat_chat_message_send_001**
 - Prompt: 在群 openConvABC 发一条消息：大家好
-- Expected: `dws chat message send --group openConvABC "大家好" --format json`
-- Flags: `--group` = `openConvABC`
+- Expected: `dws chat message send --conversation-id openConvABC "大家好" --format json`
+- Flags: `--conversation-id` = `openConvABC`
 
 **chat_chat_message_send_002**
 - Prompt: 给userId123发一条私聊消息，标题是提醒，内容是请查收报告
@@ -690,42 +756,42 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 **chat_chat_message_send_003**
 - Prompt: 在群 groupId456 发一条带标题的通知：周报提醒，请大家本周五前提交周报
-- Expected: `dws chat message send --group groupId456 --title "周报提醒" "请大家本周五前提交周报" --format json`
-- Flags: `--group` = `groupId456`, `--title` = `周报提醒`
+- Expected: `dws chat message send --conversation-id groupId456 --title "周报提醒" "请大家本周五前提交周报" --format json`
+- Flags: `--conversation-id` = `groupId456`, `--title` = `周报提醒`
 
 #### `dws chat message send-by-bot`
 
 **chat_chat_message_send_by_bot_001**
 - Prompt: 机器人发送群聊消息，text 为 ## 今日完成..., title 为 日报
 - Expected: `dws chat message send-by-bot --group <openconversation_id> --robot-code <robot-code> --text "## 今日完成..." --title 日报 --format json`
-- Flags: `--group` = `<openconversation_id>`, `--robot-code` = `<robot-code>`, `--text` = `## 今日完成...`, `--title` = `日报`
+- Flags: `--text` = `## 今日完成...`, `--group` = `<openconversation_id>`, `--robot-code` = `<robot-code>`, `--title` = `日报`
 
 **chat_chat_message_send_by_bot_002**
 - Prompt: 用机器人myBot给userId1和userId2发私聊消息，标题是通知，内容是请查收周报
 - Expected: `dws chat message send-by-bot --robot-code myBot --users userId1,userId2 --title "通知" --text "请查收周报" --format json`
-- Flags: `--robot-code` = `myBot`, `--text` = `请查收周报`, `--title` = `通知`, `--users` = `userId1,userId2`
+- Flags: `--text` = `请查收周报`, `--robot-code` = `myBot`, `--title` = `通知`, `--users` = `userId1,userId2`
 
 #### `dws chat message send-by-webhook`
 
 **chat_chat_message_send_by_webhook_001**
 - Prompt: 通过 Webhook token1 发一条告警消息：CPU 超 90%
-- Expected: `dws chat message send-by-webhook --text "CPU 超 90%" --title 告警 --token token1 --format json`
-- Flags: `--text` = `CPU 超 90%`, `--title` = `告警`, `--token` = `token1`
+- Expected: `dws chat message send-by-webhook --content "CPU 超 90%" --title 告警 --token token1 --format json`
+- Flags: `--content` = `CPU 超 90%`, `--title` = `告警`, `--token` = `token1`
 
 **chat_chat_message_send_by_webhook_002**
 - Prompt: 通过webhook发群消息，token是tokenABC，标题告警，内容CPU使用率超过90%，@所有人
-- Expected: `dws chat message send-by-webhook --token tokenABC --title "告警" --text "CPU使用率超过90%" --at-all --format json`
-- Flags: `--at-all`, `--text` = `CPU使用率超过90%`, `--title` = `告警`, `--token` = `tokenABC`
+- Expected: `dws chat message send-by-webhook --token tokenABC --title "告警" --content "CPU使用率超过90%" --at-all --format json`
+- Flags: `--at-all`, `--content` = `CPU使用率超过90%`, `--title` = `告警`, `--token` = `tokenABC`
 
 **chat_chat_message_send_by_webhook_003**
 - Prompt: 用 Webhook tokenXYZ 发消息，标题是「审批提醒」，内容是「请及时审批」，并@用户 user001 和 user002
-- Expected: `dws chat message send-by-webhook --token tokenXYZ --title "审批提醒" --text "@user001 @user002 请及时审批" --at-users user001,user002 --format json`
-- Flags: `--at-users` = `user001,user002`, `--text` = `@user001 @user002 请及时审批`, `--title` = `审批提醒`, `--token` = `tokenXYZ`
+- Expected: `dws chat message send-by-webhook --token tokenXYZ --title "审批提醒" --content "@user001 @user002 请及时审批" --at-users user001,user002 --format json`
+- Flags: `--at-users` = `user001,user002`, `--content` = `@user001 @user002 请及时审批`, `--title` = `审批提醒`, `--token` = `tokenXYZ`
 
 **chat_chat_message_send_by_webhook_004**
 - Prompt: 用 Webhook tokenDEF 发通知，标题是「会议通知」，内容是「请参加今日下午的会议」，并@手机号 13800138000 和 13900139000
-- Expected: `dws chat message send-by-webhook --token tokenDEF --title "会议通知" --text "@13800138000 @13900139000 请参加今日下午的会议" --at-mobiles 13800138000,13900139000 --format json`
-- Flags: `--at-mobiles` = `13800138000,13900139000`, `--text` = `@13800138000 @13900139000 请参加今日下午的会议`, `--title` = `会议通知`, `--token` = `tokenDEF`
+- Expected: `dws chat message send-by-webhook --token tokenDEF --title "会议通知" --content "@13800138000 @13900139000 请参加今日下午的会议" --at-mobiles 13800138000,13900139000 --format json`
+- Flags: `--at-mobiles` = `13800138000,13900139000`, `--content` = `@13800138000 @13900139000 请参加今日下午的会议`, `--title` = `会议通知`, `--token` = `tokenDEF`
 
 #### `dws chat search`
 
@@ -829,6 +895,436 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 - Prompt: 查一下 15912345678 这个手机号是哪个员工
 - Expected: `dws contact user search-mobile --mobile 15912345678 --format json`
 - Flags: `--mobile` = `15912345678`
+
+---
+
+### dev（25 条）
+
+#### `dws dev app list`
+
+**dev_app_list_001**
+- Prompt: 搜索开放平台应用，应用名是 DemoApp
+- Expected: `dws dev app list --name DemoApp --format json`
+- Flags: `--name` = `DemoApp`
+
+**dev_app_list_002**
+- Prompt: 分页查询开放平台应用，第 2 页，每页 10 条，按修改时间倒序
+- Expected: `dws dev app list --page 2 --page-size 10 --sort gmt_modified --order desc --format json`
+- Flags: `--page` = `2`, `--page-size` = `10`, `--sort` = `gmt_modified`, `--order` = `desc`
+
+**dev_app_list_003**
+- Prompt: 在开发者后台搜索企业内部应用 DemoApp
+- Expected: `dws dev app list --name DemoApp --format json`
+- Flags: `--name` = `DemoApp`
+
+#### `dws dev app get`
+
+**dev_app_get_001**
+- Prompt: 查看统一应用 UNIFIED_APP_ID 的应用详情
+- Expected: `dws dev app get --unified-app-id UNIFIED_APP_ID --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`
+
+**dev_app_get_002**
+- Prompt: 按 appKey dingxxx 查开放平台应用详情
+- Expected: `dws dev app get --app-key dingxxx --format json`
+- Flags: `--app-key` = `dingxxx`
+
+**dev_app_get_003**
+- Prompt: 查开放平台应用 DemoApp 的 appKey、clientId 和 agentId
+- Expected: `dws dev app list --name DemoApp --format json`
+- Flags: `--name` = `DemoApp`
+
+#### `dws dev app create`
+
+**dev_app_create_001**
+- Prompt: 创建一个企业内部应用，名称 DemoApp，描述是内部应用
+- Expected: `dws dev app create --name DemoApp --desc "内部应用" --type internal --dry-run --format json`
+- Flags: `--name` = `DemoApp`, `--desc` = `内部应用`, `--type` = `internal`
+
+**dev_app_create_002**
+- Prompt: 已确认创建企业内部应用 DemoApp
+- Expected: `dws dev app create --name DemoApp --type internal --yes --format json`
+- Flags: `--name` = `DemoApp`, `--type` = `internal`
+
+#### `dws dev app update`
+
+**dev_app_update_001**
+- Prompt: 把应用 UNIFIED_APP_ID 的描述改成 新描述
+- Expected: `dws dev app update --unified-app-id UNIFIED_APP_ID --desc "新描述" --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--desc` = `新描述`
+
+#### `dws dev app delete`
+
+**dev_app_delete_001**
+- Prompt: 删除开放平台应用 UNIFIED_APP_ID，先给我预览
+- Expected: `dws dev app delete --unified-app-id UNIFIED_APP_ID --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`
+
+#### `dws dev app credentials get`
+
+**dev_app_credentials_get_001**
+- Prompt: 查询应用 UNIFIED_APP_ID 的开放平台凭证
+- Expected: `dws dev app credentials get --unified-app-id UNIFIED_APP_ID --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`
+
+**dev_app_credentials_get_002**
+- Prompt: 查询 AgentId AGENT_ID 对应应用的开放平台凭证
+- Expected: `dws dev app credentials get --agent-id AGENT_ID --format json`
+- Flags: `--agent-id` = `AGENT_ID`
+
+#### `dws dev app member list`
+
+**dev_app_member_list_001**
+- Prompt: 查看开放平台应用 UNIFIED_APP_ID 的成员
+- Expected: `dws dev app member list --unified-app-id UNIFIED_APP_ID --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`
+
+#### `dws dev app member add`
+
+**dev_app_member_add_001**
+- Prompt: 给开放平台应用 UNIFIED_APP_ID 添加开发者成员 userId1,userId2，先预览
+- Expected: `dws dev app member add --unified-app-id UNIFIED_APP_ID --user-ids userId1,userId2 --member-type DEVELOPER --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--user-ids` = `userId1,userId2`, `--member-type` = `DEVELOPER`
+
+#### `dws dev app member remove`
+
+**dev_app_member_remove_001**
+- Prompt: 已确认，从开放平台应用 UNIFIED_APP_ID 移除开发者成员 userId1
+- Expected: `dws dev app member remove --unified-app-id UNIFIED_APP_ID --user-ids userId1 --member-type DEVELOPER --yes --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--user-ids` = `userId1`, `--member-type` = `DEVELOPER`, `--yes`
+
+#### `dws dev app security config`
+
+**dev_app_security_config_001**
+- Prompt: 给开放平台应用 UNIFIED_APP_ID 配置 IP 白名单 192.0.2.10，先预览
+- Expected: `dws dev app security config --unified-app-id UNIFIED_APP_ID --ip-whitelist 192.0.2.10 --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--ip-whitelist` = `192.0.2.10`
+
+#### `dws dev app permission list`
+
+**dev_app_permission_list_001**
+- Prompt: 查询应用 UNIFIED_APP_ID 已开通和未开通的全部 APP、SNS 权限
+- Expected: `dws dev app permission list --unified-app-id UNIFIED_APP_ID --status all --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--status` = `all`
+
+**dev_app_permission_list_002**
+- Prompt: 搜索应用 UNIFIED_APP_ID 里机器人发送消息相关的未开通权限
+- Expected: `dws dev app permission list --unified-app-id UNIFIED_APP_ID --keyword "机器人发送消息" --status unauthed --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--keyword` = `机器人发送消息`, `--status` = `unauthed`
+
+**dev_app_permission_list_003**
+- Prompt: 看一下权限 qyapi_robot_sendmsg 覆盖哪些 API
+- Expected: `dws dev app permission list --unified-app-id UNIFIED_APP_ID --scope qyapi_robot_sendmsg --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--scope` = `qyapi_robot_sendmsg`
+
+**dev_app_permission_list_004**
+- Prompt: 给开放平台应用 UNIFIED_APP_ID 搜索手机号权限，应用权限和个人权限都要展示
+- Expected: `dws dev app permission list --unified-app-id UNIFIED_APP_ID --keyword "手机号" --status all --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--keyword` = `手机号`, `--status` = `all`
+
+#### `dws dev app permission add`
+
+**dev_app_permission_add_001**
+- Prompt: 给应用 UNIFIED_APP_ID 申请 qyapi_robot_sendmsg 权限，先预览
+- Expected: `dws dev app permission add --unified-app-id UNIFIED_APP_ID --permissions qyapi_robot_sendmsg --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--permissions` = `qyapi_robot_sendmsg`
+
+**dev_app_permission_add_002**
+- Prompt: 已确认，给应用 UNIFIED_APP_ID 申请 Contact.User.mobile 权限
+- Expected: `dws dev app permission add --unified-app-id UNIFIED_APP_ID --permissions Contact.User.mobile --yes --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--permissions` = `Contact.User.mobile`
+
+#### `dws dev app permission remove`
+
+**dev_app_permission_remove_001**
+- Prompt: 从应用 UNIFIED_APP_ID 移除 qyapi_robot_sendmsg 权限，先预览
+- Expected: `dws dev app permission remove --unified-app-id UNIFIED_APP_ID --permission qyapi_robot_sendmsg --dry-run --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--permission` = `qyapi_robot_sendmsg`
+
+#### `dws dev app event list`
+
+**dev_app_event_list_001**
+- Prompt: 查询应用 UNIFIED_APP_ID 的事件订阅配置
+- Expected: `dws dev app event list --unified-app-id UNIFIED_APP_ID --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`
+
+#### `dws dev app version publish`
+
+**dev_app_version_publish_001**
+- Prompt: 已确认，发布应用 UNIFIED_APP_ID 的版本 VERSION_ID，审批人是 USERID
+- Expected: `dws dev app version publish --unified-app-id UNIFIED_APP_ID --version-id VERSION_ID --approver USERID --yes --format json`
+- Flags: `--unified-app-id` = `UNIFIED_APP_ID`, `--version-id` = `VERSION_ID`, `--approver` = `USERID`
+
+---
+
+### event（40 条）
+
+#### `dws event +listen-im`
+
+**event_event_consume_at_001**
+- Prompt: 监听有人 @ 我的消息
+- Expected: `dws event +listen-im --kind at-me`
+- Flags: `--kind` = `at-me`
+
+#### `dws event consume user_im_message_receive_o2o`
+
+**event_event_consume_o2o_001**
+- Prompt: 用原始 EventKey user_im_message_receive_o2o 监听我和 userId test-user-001 的单聊消息
+- Expected: `dws event consume user_im_message_receive_o2o --user test-user-001 --flatten -f ndjson`
+- Flags: `--user` = `test-user-001`
+
+**event_event_consume_o2o_open_id_001**
+- Prompt: 用原始 EventKey user_im_message_receive_o2o 监听我和 openDingtalkId abc 的单聊消息
+- Expected: `dws event consume user_im_message_receive_o2o --open-dingtalk-id abc --flatten -f ndjson`
+- Flags: `--open-dingtalk-id` = `abc`
+
+#### `dws event +listen-im`
+
+**event_event_consume_o2o_003** `[ASK_USER]`
+- Prompt: 监听我的个人单聊消息
+- Expected: `dws event +listen-im`
+
+**event_event_consume_o2o_auto_reply_001**
+- Prompt: 监听 userId test-user-001 发给我的消息，并对方发什么自动回复什么
+- Expected: `dws event +listen-im --kind sender --user test-user-001`
+- Flags: `--kind` = `sender`, `--user` = `test-user-001`
+- Contract: 等待 stderr 的 `[event] ready`；从每行 NDJSON 顶层读取 `content` 和 `sender_open_dingtalk_id`，持续读取 stdout，不使用轮询或 output-dir watcher
+
+#### `dws event +listen-im`
+
+**event_event_consume_group_001**
+- Prompt: 监听 openConversationId cid123 的群消息
+- Expected: `dws event +listen-im --kind group --chat-id cid123`
+- Flags: `--chat-id` = `cid123`, `--kind` = `group`
+- Contract: 群自动回复时直接读取事件顶层 `conversation_id`
+
+#### `dws event +listen-im`
+
+**event_event_consume_user_001**
+- Prompt: 监听 userId test-user-001 发给我的消息，包括单聊和群聊
+- Expected: `dws event +listen-im --kind sender --user test-user-001`
+- Flags: `--kind` = `sender`, `--user` = `test-user-001`
+
+**event_event_consume_user_open_id_001**
+- Prompt: 监听 openDingtalkId abc 发给我的消息，包括单聊和群聊
+- Expected: `dws event +listen-im --kind sender --open-dingtalk-id abc`
+- Flags: `--kind` = `sender`, `--open-dingtalk-id` = `abc`
+
+#### `dws event +listen-im`
+
+**event_event_consume_o2o_all_001**
+- Prompt: 监听我收到的所有单聊消息
+- Expected: `dws event +listen-im --kind all-direct`
+- Flags: `--kind` = `all-direct`
+- Contract: 只有用户明确要求“所有”时使用，不得替代指定用户的 `receive_o2o`
+
+#### `dws event +listen-im`
+
+**event_event_consume_group_all_001**
+- Prompt: 监听我所在的所有群消息
+- Expected: `dws event +listen-im --kind all-group`
+- Flags: `--kind` = `all-group`
+- Contract: 只有用户明确要求“所有”时使用，不得替代指定群的 `receive_group`
+
+#### `dws event +listen-im`
+
+**event_event_consume_read_o2o_001**
+- Prompt: 监听我发给 userId test-user-001 的单聊消息是否已读
+- Expected: `dws event +listen-im --kind sender --events read --user test-user-001`
+- Flags: `--events` = `read`, `--kind` = `sender`, `--user` = `test-user-001`
+- Contract: 从每行 NDJSON 顶层读取 `message_id`、`reader`、`reader_open_dingtalk_id`、`read_time`
+
+#### `dws event +listen-im`
+
+**event_event_consume_read_group_001**
+- Prompt: 监听 openConversationId cid123 群里我发的消息是否已读
+- Expected: `dws event +listen-im --kind group --events read --chat-id cid123`
+- Flags: `--chat-id` = `cid123`, `--events` = `read`, `--kind` = `group`
+- Contract: 从每行 NDJSON 顶层读取 `conversation_id`、`reader`、`reader_open_dingtalk_id`、`read_time`
+
+#### `dws event +listen-im`
+
+**event_event_consume_recall_o2o_001**
+- Prompt: 监听我和 userId test-user-001 的单聊消息撤回事件
+- Expected: `dws event +listen-im --kind sender --events recall --user test-user-001`
+- Flags: `--events` = `recall`, `--kind` = `sender`, `--user` = `test-user-001`
+- Contract: 从每行 NDJSON 顶层读取 `message_id`、`recaller`、`recaller_open_dingtalk_id`、`recall_time`
+
+#### `dws event +listen-im`
+
+**event_event_consume_recall_group_001**
+- Prompt: 监听 openConversationId cid123 的群消息撤回事件
+- Expected: `dws event +listen-im --kind group --events recall --chat-id cid123`
+- Flags: `--chat-id` = `cid123`, `--events` = `recall`, `--kind` = `group`
+- Contract: 从每行 NDJSON 顶层读取 `conversation_id`、`recaller`、`recaller_open_dingtalk_id`、`recall_time`
+
+#### `dws event +listen-im`
+
+**event_event_consume_reaction_o2o_001**
+- Prompt: 监听我和 userId test-user-001 的单聊消息贴表情事件
+- Expected: `dws event +listen-im --kind sender --events reaction --user test-user-001`
+- Flags: `--events` = `reaction`, `--kind` = `sender`, `--user` = `test-user-001`
+- Contract: 从每行 NDJSON 顶层读取 `operator`、`operator_open_dingtalk_id`、`reaction_name`、`operation_type`
+
+**event_event_consume_reaction_o2o_open_id_001**
+- Prompt: 监听我和 openDingtalkId abc 的单聊消息贴表情事件
+- Expected: `dws event +listen-im --kind sender --events reaction --open-dingtalk-id abc`
+- Flags: `--events` = `reaction`, `--kind` = `sender`, `--open-dingtalk-id` = `abc`
+- Contract: 从每行 NDJSON 顶层读取 `operator`、`operator_open_dingtalk_id`、`reaction_name`、`operation_type`
+
+#### `dws event +listen-im`
+
+**event_event_consume_reaction_group_001**
+- Prompt: 监听 openConversationId cid123 的群消息表情回应事件
+- Expected: `dws event +listen-im --kind group --events reaction --chat-id cid123`
+- Flags: `--chat-id` = `cid123`, `--events` = `reaction`, `--kind` = `group`
+- Contract: 从每行 NDJSON 顶层读取 `conversation_id`、`operator`、`reaction_name`、`reaction_text`、`operation_type`
+
+#### `dws event consume user_im_group_updated`
+
+**event_event_consume_group_updated_001**
+- Prompt: 监听 openConversationId cid123 群的群标题变更
+- Expected: `dws event consume user_im_group_updated --group cid123 --flatten -f ndjson`
+- Flags: `--group` = `cid123`
+- Contract: 只读取顶层公共字段和实际 `payload`，不得猜测群标题或操作者字段
+
+#### `dws event consume user_im_group_member_added`
+
+**event_event_consume_group_member_added_001**
+- Prompt: 监听有人加入 openConversationId cid123 群
+- Expected: `dws event consume user_im_group_member_added --group cid123 --flatten -f ndjson`
+- Flags: `--group` = `cid123`
+- Contract: 从顶层读取 `conversation_id`、`operator`、`operator_open_dingtalk_id`、`members`、`event_time`；`members` 支持多人并读取 `nick/open_dingtalk_id`
+
+#### `dws event consume user_im_group_member_exited`
+
+**event_event_consume_group_member_exited_001**
+- Prompt: 监听有人退出 openConversationId cid123 群
+- Expected: `dws event consume user_im_group_member_exited --group cid123 --flatten -f ndjson`
+- Flags: `--group` = `cid123`
+- Contract: 从顶层读取 `conversation_id`、`operator`、`operator_open_dingtalk_id`、`members`、`event_time`；成员自行退出时允许操作人字段为空
+
+#### `dws event consume user_im_group_disbanded`
+
+**event_event_consume_group_disbanded_001**
+- Prompt: 监听 openConversationId cid-test-disbanded 测试群被解散
+- Expected: `dws event consume user_im_group_disbanded --group cid-test-disbanded --flatten -f ndjson`
+- Flags: `--group` = `cid-test-disbanded`
+- Contract: 只监听事件；如需触发自测，必须确认目标是可销毁测试群并提示解散不可逆
+
+#### `dws chat search`
+
+**event_lookup_group_001**
+- Prompt: 监听项目群的消息
+- Expected: `dws chat search --query "项目群" --format json`
+- Flags: `--query` = `"项目群"`
+
+#### `dws event +listen-im`
+
+**event_event_consume_many_user_001**
+- Prompt: 同时监听 userId test-user-001 发给我的消息，以及我和他的单聊已读、撤回事件
+- Expected: `dws event +listen-im --kind sender --events message,read,recall --user test-user-001`
+- Flags: `--events` = `message,read,recall`, `--kind` = `sender`, `--user` = `test-user-001`
+- Contract: 保存每条 `[event] subscription` 的 subscribe ID，等待 `[event] ready event_count=3` 后处理 stdout；停止一个 subscribe ID 时其余两个继续监听
+
+#### `dws event consume` 多事件
+
+**event_event_consume_many_group_001**
+- Prompt: 同时监听 openConversationId cid123 的群消息、群改名和群解散事件
+- Expected: `dws event consume user_im_message_receive_group user_im_group_updated user_im_group_disbanded --group cid123 --flatten -f ndjson`
+- Flags: `--group` = `cid123`
+- Contract: 同一群使用一个多事件进程；不同群或不同过滤条件必须拆成多个 consume 进程
+
+#### `dws event consume` OA 审批事件
+
+**event_event_consume_oa_task_created_001**
+- Prompt: 有新的待我审批任务创建时实时通知我
+- Expected: `dws event consume user_oa_approval_task_created --flatten -f ndjson`
+
+**event_event_consume_oa_task_finished_001**
+- Prompt: 我的审批任务完成时实时通知我
+- Expected: `dws event consume user_oa_approval_task_finished --flatten -f ndjson`
+
+**event_event_consume_oa_task_redirected_001**
+- Prompt: 待我处理的审批任务被转交时实时通知我
+- Expected: `dws event consume user_oa_approval_task_redirected --flatten -f ndjson`
+
+**event_event_consume_oa_instance_started_001**
+- Prompt: 有和我相关的审批实例发起时实时通知我
+- Expected: `dws event consume user_oa_approval_instance_started --flatten -f ndjson`
+
+**event_event_consume_oa_instance_cc_001**
+- Prompt: 有审批实例抄送给我时实时通知我
+- Expected: `dws event consume user_oa_approval_instance_cc --flatten -f ndjson`
+
+**event_event_consume_oa_instance_terminated_001**
+- Prompt: 和我相关的审批实例终止时实时通知我
+- Expected: `dws event consume user_oa_approval_instance_terminated --flatten -f ndjson`
+
+**event_event_consume_oa_instance_finished_001**
+- Prompt: 我发起的审批实例完成时实时通知我
+- Expected: `dws event consume user_oa_approval_instance_finished --flatten -f ndjson`
+
+#### `dws event consume` 底层控制
+
+**event_event_consume_raw_envelope_001**
+- Prompt: 用原始 EventKey user_im_message_receive_at 监听，并输出原始 transport envelope
+- Expected: `dws event consume user_im_message_receive_at --max-events 1 -f raw`
+- Flags: `--max-events` = `1`
+
+**event_event_consume_filter_dsl_001**
+- Prompt: 用 Filter DSL 监听内容等于 urgent 的 @我消息
+- Expected: `dws event consume user_im_message_receive_at --filter-json '{"field":"content","op":"eq","value":"urgent"}' --flatten -f ndjson`
+- Flags: `--filter-json` = `{"field":"content","op":"eq","value":"urgent"}`
+
+**event_event_consume_subscribe_id_001**
+- Prompt: 复用个人事件订阅 subId-existing 继续消费十分钟
+- Expected: `dws event consume --subscribe-id subId-existing --duration 10m --flatten -f ndjson`
+- Flags: `--duration` = `10m`, `--subscribe-id` = `subId-existing`
+
+#### `dws event schema`
+
+**event_event_schema_im_001**
+- Prompt: 查看 user_im_message_receive_at 的扁平输出字段
+- Expected: `dws event schema user_im_message_receive_at --flatten -f json`
+
+**event_event_schema_oa_001**
+- Prompt: 查看 user_oa_approval_task_created 的扁平输出字段
+- Expected: `dws event schema user_oa_approval_task_created --flatten -f json`
+
+#### `dws chat message list`
+
+**event_negative_history_chat_001**
+- Prompt: 查看 cid123 群从 2026-08-01 00:00:00 开始的历史消息
+- Expected: `dws chat message list --group cid123 --time "2026-08-01 00:00:00" --format json`
+- Flags: `--group` = `cid123`, `--time` = `2026-08-01 00:00:00`
+
+#### `dws oa approval list-pending`
+
+**event_negative_oa_crud_001**
+- Prompt: 查询 8 月第一周待我处理的审批单
+- Expected: `dws oa approval list-pending --create-time-from 2026-08-01 --create-time-to 2026-08-07 --format json`
+- Flags: `--create-time-from` = `2026-08-01`, `--create-time-to` = `2026-08-07`
+
+#### `dws dev app event list`
+
+**event_negative_devapp_event_001**
+- Prompt: 查看开放平台应用 app123 已配置的回调事件
+- Expected: `dws dev app event list --unified-app-id app123 --format json`
+- Flags: `--unified-app-id` = `app123`
+
+#### `dws event status`
+
+**event_event_status_001**
+- Prompt: 查看指定单聊个人事件订阅状态
+- Expected: `dws event status --event user_im_message_receive_o2o`
+- Flags: `--event` = `user_im_message_receive_o2o`
+
+#### `dws event stop`
+
+**event_event_stop_001**
+- Prompt: 停止个人事件订阅 subId-abc123
+- Expected: `dws event stop subId-abc123`
 
 ---
 
@@ -1007,7 +1503,7 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 ---
 
-### devdoc（5 条）
+### devdoc（7 条）
 
 #### `dws devdoc article search`
 
@@ -1035,6 +1531,46 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 - Prompt: 帮我在开发者文档里找一下关于免登鉴权的资料
 - Expected: `dws devdoc article search --keyword 免登鉴权 --format json`
 - Flags: `--keyword` = `免登鉴权`
+
+#### `dws devdoc error diagnose`
+
+**devdoc_devdoc_error_diagnose_001**
+- Prompt: 排查开放平台 requestId 15r6h45w0muec 的调用失败
+- Expected: `dws devdoc error diagnose --request-id 15r6h45w0muec --format json`
+- Flags: `--request-id` = `15r6h45w0muec`
+
+**devdoc_devdoc_error_diagnose_002**
+- Prompt: 排查开放平台错误码 33012，错误描述 missing scope
+- Expected: `dws devdoc error diagnose --error-code 33012 --error-message "missing scope" --format json`
+- Flags: `--error-code` = `33012`, `--error-message` = `missing scope`
+
+**devdoc_devdoc_article_search_006**
+- Prompt: 查询开放平台 API 错误码 403 的处理文档
+- Expected: `dws devdoc article search --keyword "API 错误码 403" --format json`
+- Flags: `--keyword` = `API 错误码 403`
+
+**devdoc_devdoc_article_search_007**
+- Prompt: 开放平台机器人发消息接口怎么调用
+- Expected: `dws devdoc article search --keyword "机器人发消息接口" --format json`
+- Flags: `--keyword` = `机器人发消息接口`
+
+---
+
+### routing（3 条）
+
+#### `dws --help`
+
+**routing_routing_clarify_001** `[ASK_USER]`
+- Prompt: 帮我创建一个应用
+- Expected: `dws --help`
+
+**routing_routing_clarify_002** `[ASK_USER]`
+- Prompt: 做一个 AI 应用
+- Expected: `dws --help`
+
+**routing_routing_clarify_003** `[ASK_USER]`
+- Prompt: 创建 MCP 服务并配置 HSF tool
+- Expected: `dws --help`
 
 ---
 
@@ -1202,7 +1738,7 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 ---
 
-### workbench（4 条）
+### workbench（6 条）
 
 #### `dws workbench app get`
 
@@ -1216,6 +1752,11 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 - Expected: `dws workbench app get --ids appXYZ --format json`
 - Flags: `--ids` = `appXYZ`
 
+**workbench_workbench_app_get_003**
+- Prompt: 查工作台应用 appXYZ 的详情
+- Expected: `dws workbench app get --ids appXYZ --format json`
+- Flags: `--ids` = `appXYZ`
+
 #### `dws workbench app list`
 
 **workbench_workbench_app_list_001**
@@ -1224,6 +1765,10 @@ Agent 安装 dws skill 后，仅依据 skill 提供的参考文档，将自然�
 
 **workbench_workbench_app_list_002**
 - Prompt: 钉钉工作台上有哪些应用
+- Expected: `dws workbench app list --format json`
+
+**workbench_workbench_app_list_003**
+- Prompt: 列出所有钉钉工作台应用
 - Expected: `dws workbench app list --format json`
 
 ---

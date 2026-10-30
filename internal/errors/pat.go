@@ -14,12 +14,15 @@
 package errors
 
 import (
+	"bytes"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
 )
 
 // hostControlProvider returns the host-owned clawType for the current
@@ -104,12 +107,10 @@ const ExitCodePermission = 4
 // json.Unmarshal-able payload of the form
 // {"success":false,"code":<frozen enum>,"data":{...}}.
 //
-// When the payload includes data.uri, that URL is the authoritative
-// server-provided authorization link. Hosts must treat it as opaque and open
-// it verbatim instead of parsing and reconstructing it locally, because
-// required parameters may live in query, encoded hash, or fragment sections.
-// New hosts may prefer data.authorizationUrl when present; it preserves data.uri
-// while adding a copy/open-safe URL for legacy DingTalk hash-route variants.
+// When the payload includes data.uri/authUrl/authorizationUrl, that value is
+// the authoritative server-provided authorization link. The CLI accepts all
+// legacy aliases, normalizes the known DingTalk hash-route variant, and emits a
+// single data.uri field so terminals and hosts do not need to deduplicate links.
 type PATError struct {
 	RawJSON string
 }
@@ -123,12 +124,16 @@ func (e *PATError) ExitCode() int { return ExitCodePermission }
 func (e *PATError) RawStderr() string { return e.RawJSON }
 
 // patNoPermissionCodes are PAT error codes that should be passed through
-// as transparent PATError without CLI-level wrapping.
+// as transparent PATError without CLI-level wrapping. Some of these are
+// grantable by user authorization; PAT_ORG_POLICY_DENIED is terminal until an
+// org admin changes the policy, but it still belongs to the PAT permission
+// channel so hosts see exit=4 and the raw PAT JSON contract.
 var patNoPermissionCodes = map[string]bool{
 	"PAT_NO_PERMISSION":             true,
 	"PAT_LOW_RISK_NO_PERMISSION":    true,
 	"PAT_MEDIUM_RISK_NO_PERMISSION": true,
 	"PAT_HIGH_RISK_NO_PERMISSION":   true,
+	"PAT_ORG_POLICY_DENIED":         true,
 }
 
 // patAuthRequiredCodes are error codes that trigger the PAT authorization
@@ -146,6 +151,7 @@ var patNoPermissionCodes = map[string]bool{
 //     `dws auth login --scope <data.missingScope>`.
 var patAuthRequiredCodes = map[string]bool{
 	"AGENT_CODE_NOT_EXISTS":   true,
+	"PAT_BATCH_AUTH_PENDING":  true,
 	"PAT_SCOPE_AUTH_REQUIRED": true,
 }
 
@@ -240,7 +246,7 @@ func isBusinessError(body map[string]any) bool {
 // Check order: DWS gateway auth > PAT permission.
 func ClassifyToolResultContent(content map[string]any) error {
 	if _, ok := getDWSGatewayErrorCode(content); ok {
-		raw, _ := json.Marshal(content)
+		raw, _ := jsonutil.Marshal(content)
 		return NewAuth(string(raw),
 			WithReason("gateway_auth_expired"),
 			WithHint(authExpiredHint()),
@@ -347,19 +353,37 @@ var patTopLevelStrip = map[string]bool{
 // function instead of writing the fields directly. out["data"] is
 // promoted to map[string]any if missing or of the wrong type.
 func ApplyHostMutations(out map[string]any) {
-	data, ok := out["data"].(map[string]any)
-	if !ok || data == nil {
-		data = map[string]any{}
-		out["data"] = data
-	}
-	if rawURI, ok := data["uri"].(string); ok && strings.TrimSpace(rawURI) != "" {
-		data["authorizationUrl"] = PATAuthorizationURL(rawURI)
+	data := ensurePATData(out)
+	if rawURI := patAuthorizationURIFromData(data); rawURI != "" {
+		authURL := PATAuthorizationURL(rawURI)
+		data["uri"] = authURL
+		delete(data, "authUrl")
+		delete(data, "authorizationUrl")
 	}
 	if block := HostControlBlock(); block != nil {
 		delete(data, "callbacks")
 		data["hostControl"] = block
 	}
 	data["openBrowser"] = PATOpenBrowserValue()
+}
+
+func ensurePATData(out map[string]any) map[string]any {
+	data, ok := out["data"].(map[string]any)
+	if !ok || data == nil {
+		data = map[string]any{}
+		out["data"] = data
+	}
+	return data
+}
+
+func patAuthorizationURIFromData(data map[string]any) string {
+	for _, key := range []string{"uri", "authUrl", "authorizationUrl"} {
+		value, _ := data[key].(string)
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // PATAuthorizationURL returns the best URL for hosts to open or show to users.
@@ -442,9 +466,9 @@ func cleanPATJSON(body map[string]any, code string) string {
 		"code":    code,
 	}
 	if data, ok := body["data"]; ok {
-		// Keep data.uri exactly as returned by the service. Host consumers open
-		// that link directly, so local normalization would risk dropping
-		// parameters embedded in query/hash/fragment sections.
+		// ApplyHostMutations canonicalizes PAT URL aliases into one data.uri
+		// before JSON encoding, while stripClassFields keeps the rest of the
+		// service payload intact.
 		out["data"] = stripClassFields(data)
 	} else {
 		fallback := map[string]any{}
@@ -458,15 +482,68 @@ func cleanPATJSON(body map[string]any, code string) string {
 		}
 	}
 	ApplyHostMutations(out)
+	if code == "PAT_ORG_POLICY_DENIED" {
+		applyOrgPolicyDeniedHint(out, body)
+	}
 
 	// stderr JSON MUST be a single-line, directly json.Unmarshal-able
 	// payload — pretty-printing would break naïve host parsers that read
 	// stderr line-by-line and fail on leading whitespace.
-	b, err := json.Marshal(out)
+	b, err := marshalSingleLineJSONNoHTMLEscape(out)
 	if err != nil {
 		return fmt.Sprintf(`{"success":false,"code":"%s"}`, code)
 	}
 	return string(b)
+}
+
+func applyOrgPolicyDeniedHint(out map[string]any, body map[string]any) {
+	data := ensurePATData(out)
+	if stringValue(data, "policy") == "" {
+		data["policy"] = "OPEN_SOURCE_ORG_SCOPE_FORBIDDEN"
+	}
+	if stringValue(data, "message") == "" {
+		if msg := stringValue(body, "message", "errorMsg", "error"); msg != "" {
+			data["message"] = msg
+		}
+	}
+	if stringValue(data, "hint") == "" {
+		if desc := stringValue(data, "policyDesc", "message"); desc != "" {
+			data["hint"] = "组织策略已禁止当前工具所需的开源数据权限：" + desc +
+				"。请联系组织管理员在 DWS/PAT 权限管控中放开对应 scope 后重试。"
+		} else {
+			data["hint"] = "组织策略已禁止当前工具所需的开源数据权限，请联系组织管理员在 DWS/PAT 权限管控中放开对应 scope 后重试。"
+		}
+	}
+	data["action"] = "contact_org_admin"
+	data["openBrowser"] = false
+	data["retryable"] = false
+}
+
+func stringValue(body map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := body[key].(string)
+		if !ok {
+			continue
+		}
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func marshalSingleLineJSONNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	out := buf.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return out, nil
 }
 
 // ---- Runner adapter functions ------------------------------------------------

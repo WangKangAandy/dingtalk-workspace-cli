@@ -14,10 +14,30 @@
 package keychain
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "dws-keychain-test-*")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv(StorageDirEnv, dir)
+	_ = os.Setenv(TestNamespaceEnv, dir)
+	_ = os.Setenv(DisableKeychainEnv, "1")
+	code := m.Run()
+	if err := RemoveAuthTokenEntries(Service); err != nil {
+		fmt.Fprintf(os.Stderr, "internal/keychain test cleanup: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func TestKeychainBasicOperations(t *testing.T) {
 	t.Parallel()
@@ -87,6 +107,23 @@ func TestKeychainNonExistentAccount(t *testing.T) {
 	}
 }
 
+func TestGetNonExistentAccountDoesNotCreateFileDEK(t *testing.T) {
+	service := "test-service-readonly-" + t.Name()
+	account := "nonexistent-account"
+	dekPath := filepath.Join(StorageDir(service), "dek")
+
+	got, err := Get(service, account)
+	if err != nil {
+		t.Fatalf("Get() error = %v, want nil", err)
+	}
+	if got != "" {
+		t.Fatalf("Get() = %q, want empty string", got)
+	}
+	if _, err := os.Stat(dekPath); !os.IsNotExist(err) {
+		t.Fatalf("Get() created DEK at %s; stat error = %v", dekPath, err)
+	}
+}
+
 func TestKeychainOverwrite(t *testing.T) {
 	t.Parallel()
 
@@ -114,6 +151,65 @@ func TestKeychainOverwrite(t *testing.T) {
 	}
 	if got != "overwritten" {
 		t.Fatalf("Get() = %q, want %q", got, "overwritten")
+	}
+}
+
+func TestRemoveAuthTokenEntriesPreservesOtherAccounts(t *testing.T) {
+	service := "test-service-" + t.Name()
+	authAccounts := []string{
+		AccountToken,
+		AccountToken + ":corp-a",
+		AccountToken + ":id:0123456789abcdef",
+	}
+	for _, account := range authAccounts {
+		if err := Set(service, account, "secret"); err != nil {
+			t.Fatalf("Set(%q) error = %v", account, err)
+		}
+	}
+	const unrelated = "app-secret:client-a"
+	if err := Set(service, unrelated, "preserve"); err != nil {
+		t.Fatalf("Set(unrelated) error = %v", err)
+	}
+
+	if err := RemoveAuthTokenEntries(service); err != nil {
+		t.Fatalf("RemoveAuthTokenEntries() error = %v", err)
+	}
+	for _, account := range authAccounts {
+		if Exists(service, account) {
+			t.Fatalf("auth account %q still exists", account)
+		}
+	}
+	if got, err := Get(service, unrelated); err != nil || got != "preserve" {
+		t.Fatalf("unrelated account = %q, %v; want preserved", got, err)
+	}
+}
+
+func TestCrossPlatformCoverageRemoveAccountEntriesWithPrefixesPreservesUnrelatedAccounts(t *testing.T) {
+	service := "test-prefix-cleanup"
+	entries := map[string]string{
+		"appsecret:client-a":     "secret-a",
+		"client-secret:client-b": "secret-b",
+		"app-token:client-a":     "token-a",
+		"auth-token":             "user-token",
+		"unrelated":              "keep",
+	}
+	for account, value := range entries {
+		if err := Set(service, account, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RemoveAccountEntriesWithPrefixes(service, "appsecret:", "client-secret:", "app-token:"); err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []string{"appsecret:client-a", "client-secret:client-b", "app-token:client-a"} {
+		if got, err := Get(service, account); err != nil || got != "" {
+			t.Fatalf("credential %q survived: %q, %v", account, got, err)
+		}
+	}
+	for account, want := range map[string]string{"auth-token": "user-token", "unrelated": "keep"} {
+		if got, err := Get(service, account); err != nil || got != want {
+			t.Fatalf("unrelated %q = %q, %v; want %q", account, got, err, want)
+		}
 	}
 }
 

@@ -38,6 +38,8 @@ const (
 	maxBackups = 2
 )
 
+var openLogFile = os.OpenFile
+
 // FileLogger wraps a rotatingWriter and provides a structured slog.Logger
 // that writes JSON lines to disk.
 type FileLogger struct {
@@ -77,12 +79,26 @@ func (fl *FileLogger) Writer() io.Writer {
 	return fl.writer
 }
 
-// Close flushes and closes the underlying log file.
+// Close flushes and permanently closes the underlying log file. Later writes
+// fail with os.ErrClosed instead of reopening the file.
 func (fl *FileLogger) Close() error {
 	if fl == nil || fl.writer == nil {
 		return nil
 	}
 	return fl.writer.close()
+}
+
+// NewRotatingFile opens path as a size-rotating log file (same rotation policy
+// as the diagnostic logger: maxLogSize per file, maxBackups kept) and returns an
+// io.WriteCloser. The caller owns the returned writer and must Close it. Used by
+// the connect daemon to archive a long-running connector's stdout/stderr without
+// reimplementing rotation. Returns an error if the file cannot be opened.
+func NewRotatingFile(path string) (io.WriteCloser, error) {
+	w := newRotatingWriter(path, maxLogSize, maxBackups)
+	if err := w.open(); err != nil {
+		return nil, err
+	}
+	return w, nil
 }
 
 func newNopFileLogger() *FileLogger {
@@ -107,6 +123,7 @@ type rotatingWriter struct {
 	mu      sync.Mutex
 	file    *os.File
 	written int64
+	closed  bool
 }
 
 func newRotatingWriter(path string, maxSize int64, maxBackups int) *rotatingWriter {
@@ -120,8 +137,11 @@ func newRotatingWriter(path string, maxSize int64, maxBackups int) *rotatingWrit
 func (w *rotatingWriter) open() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
 
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, config.FilePerm)
+	f, err := openLogFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, config.FilePerm)
 	if err != nil {
 		return err
 	}
@@ -138,6 +158,9 @@ func (w *rotatingWriter) open() error {
 func (w *rotatingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
 
 	// Attempt to recover if file was lost (e.g. rotation failed due to full disk).
 	if w.file == nil {
@@ -162,7 +185,10 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 
 // reopenLocked tries to reopen the log file. Caller must hold w.mu.
 func (w *rotatingWriter) reopenLocked() error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, config.FilePerm)
+	if w.closed {
+		return os.ErrClosed
+	}
+	f, err := openLogFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, config.FilePerm)
 	if err != nil {
 		return err
 	}
@@ -176,10 +202,18 @@ func (w *rotatingWriter) reopenLocked() error {
 	return nil
 }
 
+// Close implements io.Closer so rotatingWriter can be returned as an
+// io.WriteCloser (see NewRotatingFile).
+func (w *rotatingWriter) Close() error { return w.close() }
+
 func (w *rotatingWriter) close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	if w.file == nil {
 		return nil
 	}
@@ -202,7 +236,7 @@ func (w *rotatingWriter) rotate() {
 		os.Rename(src, dst)
 	}
 
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, config.FilePerm)
+	f, err := openLogFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, config.FilePerm)
 	if err != nil {
 		return
 	}

@@ -21,6 +21,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/agentproduct"
 	"github.com/spf13/cobra"
 )
 
@@ -53,6 +54,36 @@ type ToolCaller interface {
 	Format() string
 	// DryRun returns true when --dry-run is active.
 	DryRun() bool
+	// Fields returns the global --fields output projection ("" if unset).
+	Fields() string
+	// JQ returns the global --jq output filter expression ("" if unset).
+	JQ() string
+}
+
+// AccessTokenCaller is an optional capability for narrow OpenAPI operations
+// that cannot use MCP JSON-RPC, such as streaming multipart file upload.
+type AccessTokenCaller interface {
+	AccessToken(ctx context.Context) (string, error)
+}
+
+// ReadToolCaller is an optional capability for a narrowly classified read
+// lookup that must still execute while the outer command is rendering a
+// dry-run plan. Implementations must fail closed unless they can bypass the
+// global write barrier without weakening it for ordinary CallTool calls.
+//
+// The Shortcut runtime uses this only after accepting a narrow read-only tool
+// name classification.
+// Keeping it separate from ToolCaller means existing callers remain protected
+// by the default "dry-run executes nothing" contract.
+type ReadToolCaller interface {
+	CallReadTool(ctx context.Context, productID, toolName string, args map[string]any) (*ToolResult, error)
+}
+
+// WhiteboardTemplatePreviewCaller performs only the reviewed template service
+// preflight with boolean dryRun=true. It must never fall back to an ordinary
+// write call when the capability or a required guard is missing.
+type WhiteboardTemplatePreviewCaller interface {
+	CallWhiteboardTemplatePreview(ctx context.Context, toolName string, args map[string]any) (*ToolResult, error)
 }
 
 // RuntimeDefaultFn resolves a single runtimeDefault placeholder (e.g.
@@ -68,6 +99,20 @@ type Hooks struct {
 	Name         string // "open" (default) / overlay identifier
 	ScenarioCode string // injected into x-dingtalk-scenario-code header
 
+	// ClawTypeValue is the display identity carried only in message-send tool
+	// arguments (parameter clawType) so the IM server can render the
+	// "Send from AI" indicator on delivered messages. A valid non-empty
+	// DWS_AGENT_PRODUCT overrides this display default, but never the separate
+	// HTTP claw-type routing/PAT header. Empty → DefaultOSSClawType; overlays
+	// set their own message-display default (e.g. "wukong").
+	ClawTypeValue string
+
+	// PersonalEventSourceID identifies the personal-event source channel
+	// used by dws event --as user. Empty → "open". Overlays set their own
+	// value through Override; open-source core never infers custom sources
+	// from environment/user input.
+	PersonalEventSourceID string
+
 	// --- runtime mode ---
 	IsEmbedded     bool // true when running inside a host application
 	HideAuthLogin  bool // true suppresses the "dws auth login" command
@@ -77,13 +122,28 @@ type Hooks struct {
 	ConfigDir func() string // custom config directory; nil → ~/.dws
 
 	// --- HTTP headers ---
+	// MergeHeaders must preserve base headers. If it sets claw-type, that value
+	// must be deterministic and independent of the supplied base map because
+	// PAT error serialization resolves it with an empty map. The hook must not
+	// perform network, keychain, credential-refresh, or other blocking work.
 	MergeHeaders func(base map[string]string) map[string]string
+
+	// --- EnterpriseCredential HTTP headers ---
+	// This hook is only for credential material. It must not set claw-type or
+	// x-dws-agent-product; the core reasserts both after the hook returns.
+	EnterpriseCredentialHeaders func(base map[string]string) map[string]string
 
 	// --- auth ---
 	AuthClientID      string // OAuth client ID for device-flow authorisation
 	AuthClientFromMCP bool   // true → fetch client ID from MCP at runtime
 	OnAuthError       func(configDir string, err error) error
 	TokenProvider     func(ctx context.Context, fallback func() (string, error)) (string, error)
+
+	// OIDCProviders registers the SDK authorizers available to auth provider-login.
+	// Return declarations only: enumeration must not initialize SDKs or perform
+	// I/O. Names must be unique and Authorize must be non-nil. Nil/empty means
+	// no SDK integration; the core does not install a provider-specific fallback.
+	OIDCProviders func() []OIDCProvider
 
 	// --- token persistence (overlay-managed keychain / encrypted storage) ---
 	SaveToken   func(configDir string, data []byte) error // persist token blob
@@ -164,4 +224,30 @@ func Override(h *Hooks) {
 	mu.Lock()
 	defer mu.Unlock()
 	current = h
+}
+
+// ClawType returns the message-display identity for the active edition.
+// A valid non-empty DWS_AGENT_PRODUCT wins; otherwise the active edition's
+// ClawTypeValue (or DefaultOSSClawType) is used. Message-send helpers attach
+// this value as the clawType tool argument so the IM server can label delivered
+// messages as sent via AI. It never changes the HTTP claw-type routing/PAT
+// header.
+func ClawType() string {
+	fallback := Get().ClawTypeValue
+	if fallback == "" {
+		fallback = DefaultOSSClawType
+	}
+	value, err := agentproduct.ResolveFromEnv(fallback)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+// PersonalEventSourceID returns the source channel for user-level events.
+func PersonalEventSourceID() string {
+	if v := Get().PersonalEventSourceID; v != "" {
+		return v
+	}
+	return "open"
 }

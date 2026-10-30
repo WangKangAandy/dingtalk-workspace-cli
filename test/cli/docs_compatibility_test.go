@@ -20,8 +20,6 @@ type docsFlagCase struct {
 }
 
 func TestDWSDocsCommandTreeCoverage(t *testing.T) {
-	t.Parallel()
-
 	docPaths, _, err := parseDWSDocsCompatibility()
 	if err != nil {
 		t.Fatalf("parseDWSDocsCompatibility() error = %v", err)
@@ -30,17 +28,10 @@ func TestDWSDocsCommandTreeCoverage(t *testing.T) {
 		t.Skip("no command paths parsed from docs/dws (directory may not exist)")
 	}
 
-	index := buildCommandIndex(app.NewRootCommand())
-	// Commands documented in baseline but intentionally not implemented.
-	excluded := map[string]struct{}{
-		"dws auth export": {},
-	}
+	index := buildCommandIndex(app.NewSchemaSourceRootCommand())
 	missing := make([]string, 0)
 	for _, path := range docPaths {
 		if _, ok := index[path]; ok {
-			continue
-		}
-		if _, ok := excluded[path]; ok {
 			continue
 		}
 		missing = append(missing, path)
@@ -52,8 +43,6 @@ func TestDWSDocsCommandTreeCoverage(t *testing.T) {
 }
 
 func TestDWSDocsLocalFlagsCoverage(t *testing.T) {
-	t.Parallel()
-
 	docPaths, docFlags, err := parseDWSDocsCompatibility()
 	if err != nil {
 		t.Fatalf("parseDWSDocsCompatibility() error = %v", err)
@@ -63,20 +52,13 @@ func TestDWSDocsLocalFlagsCoverage(t *testing.T) {
 	}
 	docLeafSet := leafCommandSet(docPaths)
 
-	index := buildCommandIndex(app.NewRootCommand())
-	// Commands documented in baseline but intentionally not implemented.
-	excluded := map[string]struct{}{
-		"dws auth export": {},
-	}
+	index := buildCommandIndex(app.NewSchemaSourceRootCommand())
 	missing := make([]string, 0)
 	fallbackMatched := 0
 	explicitMatched := 0
 
 	for _, tc := range docFlags {
 		if _, isLeaf := docLeafSet[tc.CommandPath]; !isLeaf {
-			continue
-		}
-		if _, ok := excluded[tc.CommandPath]; ok {
 			continue
 		}
 		cmd, ok := index[tc.CommandPath]

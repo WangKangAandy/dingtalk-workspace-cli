@@ -22,7 +22,26 @@ import (
 	"runtime"
 )
 
+var browserStartCommand = func(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Wait for process to prevent resource leak
+	// Run in goroutine to avoid blocking browser launch
+	go func() {
+		_ = cmd.Wait()
+	}()
+
+	return nil
+}
+
 func openBrowser(rawURL string) error {
+	return openBrowserForOS(runtime.GOOS, rawURL)
+}
+
+func openBrowserForOS(goos, rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -31,14 +50,14 @@ func openBrowser(rawURL string) error {
 		return fmt.Errorf("refused to open URL with disallowed scheme %q", parsed.Scheme)
 	}
 
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
+	var command string
+	switch goos {
 	case "darwin":
-		cmd = exec.Command("open", rawURL)
+		command = "open"
 	case "linux":
-		cmd = exec.Command("xdg-open", rawURL)
+		command = "xdg-open"
 	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+		return fmt.Errorf("unsupported platform: %s", goos)
 	}
-	return cmd.Start()
+	return browserStartCommand(command, rawURL)
 }

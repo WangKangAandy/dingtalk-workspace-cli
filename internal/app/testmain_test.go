@@ -14,9 +14,12 @@
 package app
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/audit"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/keychain"
 )
 
@@ -35,7 +38,19 @@ import (
 // Setting keychain.StorageDirEnv here forces every keychain read/write in
 // this binary into a per-process tempdir, eliminating that contamination
 // without touching production code.
+//
+// PAT authorization tests also exercise code paths that normally open the
+// system browser. Keep the package-wide default opener inert so running the
+// test binary never launches a page on the developer's machine; tests that
+// need to assert the URL can still replace openBrowserFunc locally.
 func TestMain(m *testing.M) {
+	if code, ok := runPersonalAppKeyE2EChild(); ok {
+		os.Exit(code)
+	}
+	if code, ok := runRuntimeTokenDetachedE2EChild(); ok {
+		os.Exit(code)
+	}
+
 	tmpDir, err := os.MkdirTemp("", "dws-app-test-keychain-")
 	if err != nil {
 		panic("create test keychain tempdir: " + err.Error())
@@ -44,7 +59,54 @@ func TestMain(m *testing.M) {
 		_ = os.RemoveAll(tmpDir)
 		panic("set " + keychain.StorageDirEnv + ": " + err.Error())
 	}
+	if err := os.Setenv(keychain.TestNamespaceEnv, tmpDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		panic("set " + keychain.TestNamespaceEnv + ": " + err.Error())
+	}
+	if err := os.Setenv("DWS_CONFIG_DIR", filepath.Join(tmpDir, "config")); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		panic("set DWS_CONFIG_DIR: " + err.Error())
+	}
+	for key, value := range map[string]string{
+		// 普通命令测试保持离线；版本检查测试显式清除此开关并使用本地 HTTP 服务。
+		"DWS_NO_UPDATE_CHECK":  "1",
+		audit.EnvAudit:         "1",
+		audit.EnvAuditDir:      filepath.Join(tmpDir, "audit"),
+		audit.EnvRetentionDays: "1",
+		audit.EnvForwardURL:    "",
+		audit.EnvForwardToken:  "",
+		audit.EnvForwardRedact: "none",
+		audit.EnvAuditDebug:    "",
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			panic("set " + key + ": " + err.Error())
+		}
+	}
+	// Keep the process-wide audit sink outside per-test TempDir trees. Cobra
+	// skips PersistentPostRunE on expected command errors, and Windows cannot
+	// remove a TempDir while the audit lock is still open.
+	setupAuditSink()
+	openBrowserFunc = func(string) error { return nil }
+	// App tests may run in filtered CI processes. Install the same lazy Schema
+	// source factory as NewRootCommand without constructing a root so ResolveMeta
+	// tests never depend on an earlier test having initialized process state.
+	registerSchemaRuntimeDelivery()
 	code := m.Run()
-	_ = os.RemoveAll(tmpDir)
+	StopAllStdioClients()
+	CloseAuditSink()
+	CloseFileLogger()
+	if err := keychain.RemoveAuthTokenEntries(keychain.Service); err != nil {
+		fmt.Fprintf(os.Stderr, "internal/app keychain cleanup: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	if err := os.RemoveAll(tmpDir); err != nil {
+		fmt.Fprintf(os.Stderr, "internal/app test cleanup %s: %v\n", tmpDir, err)
+		if code == 0 {
+			code = 1
+		}
+	}
 	os.Exit(code)
 }

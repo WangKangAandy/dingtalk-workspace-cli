@@ -7,13 +7,39 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/corecmd"
 )
+
+func TestCrossPlatformCoverageUpgradeHelpDoesNotMakeFullSkillRefreshForceOnly(t *testing.T) {
+	cmd := newUpgradeCommand()
+	force := cmd.Flags().Lookup("force")
+	if force == nil {
+		t.Fatal("upgrade --force flag is missing")
+	}
+	for _, text := range []string{cmd.Example, force.Usage} {
+		if strings.Contains(text, "恢复全部官方 Skill") {
+			t.Fatalf("upgrade help still implies that only --force performs the full Skill refresh: %q", text)
+		}
+	}
+	if !strings.Contains(force.Usage, "已是最新版本") {
+		t.Fatalf("upgrade --force help must explain its remaining purpose, got %q", force.Usage)
+	}
+	for _, want := range []string{"每次升级", "全量覆盖预制 Skill", "--force 仅额外允许重装当前版本"} {
+		if !strings.Contains(cmd.Long, want) {
+			t.Fatalf("upgrade help missing full-refresh contract %q: %s", want, cmd.Long)
+		}
+	}
+}
 
 // --- ensureV ---
 
@@ -392,7 +418,7 @@ func TestNewUpgradeCommand_Flags(t *testing.T) {
 		t.Errorf("Use = %q, want upgrade", cmd.Use)
 	}
 
-	expectedFlags := []string{"check", "list", "version", "rollback", "force", "skip-skills"}
+	expectedFlags := []string{"check", "list", "version", "beta", "rollback", "force", "skip-skills"}
 	for _, name := range expectedFlags {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("missing flag: --%s", name)
@@ -404,7 +430,7 @@ func TestNewUpgradeCommand_NoArgs(t *testing.T) {
 	cmd := newUpgradeCommand()
 	// Simulate passing positional args - should error with cobra.NoArgs
 	cmd.SetArgs([]string{"rollback"})
-	err := cmd.Execute()
+	err := corecmd.ExecuteForTest(cmd)
 	if err == nil {
 		t.Error("expected error for positional args (NoArgs)")
 	}
@@ -415,7 +441,7 @@ func TestNewUpgradeCommand_Help(t *testing.T) {
 	var buf bytes.Buffer
 	cmd.SetOut(&buf)
 	cmd.SetArgs([]string{"--help"})
-	cmd.Execute()
+	corecmd.ExecuteForTest(cmd)
 	help := buf.String()
 
 	if !strings.Contains(help, "upgrade") {
@@ -426,5 +452,182 @@ func TestNewUpgradeCommand_Help(t *testing.T) {
 	}
 	if !strings.Contains(help, "--rollback") {
 		t.Error("help should contain --rollback")
+	}
+	if !strings.Contains(help, "--beta") {
+		t.Error("help should contain --beta")
+	}
+	// Regression for #364: --dry-run must be discoverable from upgrade help so
+	// users know it is supported (and is now actually honored).
+	if !strings.Contains(help, "--dry-run") {
+		t.Error("help should advertise --dry-run for upgrade")
+	}
+}
+
+func TestNewUpgradeCommand_BetaAndVersionAreMutuallyExclusive(t *testing.T) {
+	cmd := newUpgradeCommand()
+	cmd.SetArgs([]string{"--beta", "--version", "v1.0.8-beta.1"})
+	err := corecmd.ExecuteForTest(cmd)
+	if err == nil {
+		t.Fatal("expected error for --beta with --version")
+	}
+	if !strings.Contains(err.Error(), "--beta") || !strings.Contains(err.Error(), "--version") {
+		t.Fatalf("error = %q, want to mention --beta and --version", err.Error())
+	}
+}
+
+func TestUpgradeTrack(t *testing.T) {
+	if got := upgradeTrack(false); got != "release" {
+		t.Fatalf("upgradeTrack(false) = %q, want release", got)
+	}
+	if got := upgradeTrack(true); got != "beta" {
+		t.Fatalf("upgradeTrack(true) = %q, want beta", got)
+	}
+	if got := upgradeHintForTrack("beta"); !strings.Contains(got, "--beta") {
+		t.Fatalf("upgradeHintForTrack(beta) = %q, want --beta hint", got)
+	}
+}
+
+// --- writeDryRunPlan (#364) ---
+//
+// Regression for #364: `dws upgrade --dry-run` previously performed a real
+// upgrade because the flag was silently ignored. The dry-run path must now be
+// preview-only — it describes the steps without downloading or replacing
+// anything. writeDryRunPlan is the side-effect-free renderer for that preview.
+
+func TestWriteDryRunPlan_PreviewOnly(t *testing.T) {
+	var buf bytes.Buffer
+	writeDryRunPlan(&buf, "v1.0.30", "dws-darwin-arm64.tar.gz", false)
+	out := buf.String()
+
+	if !strings.Contains(out, "dry-run") {
+		t.Errorf("output should be marked as dry-run, got:\n%s", out)
+	}
+	if !strings.Contains(out, "不会下载或修改任何文件") {
+		t.Errorf("output should state nothing is downloaded or modified, got:\n%s", out)
+	}
+	if !strings.Contains(out, "dws-darwin-arm64.tar.gz") {
+		t.Errorf("output should name the resolved platform asset, got:\n%s", out)
+	}
+	// All five steps should be previewed, including the (skipped) replace step.
+	for _, step := range []string{"[1/5]", "[2/5]", "[3/5]", "[4/5]", "[5/5]"} {
+		if !strings.Contains(out, step) {
+			t.Errorf("output missing step %s, got:\n%s", step, out)
+		}
+	}
+}
+
+func TestWriteDryRunPlan_WithSkills(t *testing.T) {
+	var buf bytes.Buffer
+	writeDryRunPlan(&buf, "v1.0.30", "dws-linux-amd64.tar.gz", true)
+	out := buf.String()
+
+	if !strings.Contains(out, "dws-skills.zip") {
+		t.Errorf("with skills, output should mention dws-skills.zip, got:\n%s", out)
+	}
+	if !strings.Contains(out, "安装技能包") {
+		t.Errorf("with skills, replace step should mention installing skills, got:\n%s", out)
+	}
+
+	// Without skills, neither should appear.
+	var buf2 bytes.Buffer
+	writeDryRunPlan(&buf2, "v1.0.30", "dws-linux-amd64.tar.gz", false)
+	if strings.Contains(buf2.String(), "dws-skills.zip") {
+		t.Errorf("without skills, output should not mention dws-skills.zip, got:\n%s", buf2.String())
+	}
+}
+
+// --- isLikelyAMFIKill ---
+
+func TestIsLikelyAMFIKill(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"signal killed (real Go format)", errors.New("signal: killed"), true},
+		{"signal kill variant", errors.New("signal: kill"), true},
+		{"unrelated error", errors.New("exit status 1"), false},
+		{"file not found", errors.New("no such file or directory"), false},
+		{"wrapped killed in middle", errors.New("exec: signal: killed: cleanup"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isLikelyAMFIKill(tt.err); got != tt.want {
+				t.Errorf("isLikelyAMFIKill(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- validateNewBinary self-heal (darwin only) ---
+//
+// On macOS, an unsigned arm64 binary is SIGKILL'd by amfid. This test verifies
+// validateNewBinary recovers via repairDarwinBinary (ad-hoc codesign) and
+// successfully re-executes the binary. We use go itself as a stand-in for the
+// new dws binary — it's a real signed Mach-O we can strip and re-sign.
+//
+// GitHub's hosted macOS runners do not reproduce the amfid kill, so in CI this
+// test reports a skip that names the unverified path rather than implying the
+// self-heal was exercised. Set DWS_REQUIRE_AMFI_SELF_HEAL=1 on a host that does
+// enforce amfid to turn such a vacuous run into a hard failure.
+
+const requireAMFISelfHealEnv = "DWS_REQUIRE_AMFI_SELF_HEAL"
+
+func TestValidateNewBinary_RecoversFromUnsignedDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("amfid SIGKILL only happens on macOS")
+	}
+	if _, err := exec.LookPath("codesign"); err != nil {
+		t.Skip("codesign not available")
+	}
+
+	// Build a fresh dws binary into a temp dir.
+	tmpDir := t.TempDir()
+	bin := filepath.Join(tmpDir, "dws-test")
+
+	// Locate repo root from this test file's location.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	repoRoot := filepath.Join(wd, "..", "..")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd")
+	cmd.Dir = repoRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	// Strip signature to reproduce the unsigned state from CI cross-compilation.
+	if out, err := exec.Command("codesign", "--remove-signature", bin).CombinedOutput(); err != nil {
+		t.Fatalf("strip signature: %v\n%s", err, out)
+	}
+
+	// Sanity: confirm direct exec is killed. When it is not, repairDarwinBinary
+	// never runs and the rest of this test proves nothing — say so.
+	if _, err := tryExecVersion(bin); err == nil {
+		const unverified = "amfid did not kill the unsigned binary, so repairDarwinBinary was NOT exercised"
+		if os.Getenv(requireAMFISelfHealEnv) == "1" {
+			t.Fatalf("%s (%s=1)", unverified, requireAMFISelfHealEnv)
+		}
+		t.Skipf("%s — host does not enforce amfid (Intel Mac, SIP disabled, or hosted runner)", unverified)
+	}
+
+	// validateNewBinary should self-heal and succeed.
+	if err := validateNewBinary(bin, "dev"); err != nil {
+		if strings.Contains(err.Error(), "signal: killed") {
+			const unverified = "host security policy still rejects the ad-hoc signed binary, so the self-heal outcome was NOT verified"
+			if os.Getenv(requireAMFISelfHealEnv) == "1" {
+				t.Fatalf("%s (%s=1): %v", unverified, requireAMFISelfHealEnv, err)
+			}
+			t.Skipf("%s: %v", unverified, err)
+		}
+		t.Fatalf("validateNewBinary did not recover: %v", err)
+	}
+
+	// Verify the binary now has an ad-hoc signature.
+	out, _ := exec.Command("codesign", "-dv", bin).CombinedOutput()
+	if !strings.Contains(string(out), "Signature=adhoc") {
+		t.Errorf("expected adhoc signature, got: %s", out)
 	}
 }

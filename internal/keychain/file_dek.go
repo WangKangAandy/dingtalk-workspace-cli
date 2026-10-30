@@ -11,11 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || linux
+//go:build darwin || linux || openharmony
 
 package keychain
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -24,37 +25,46 @@ import (
 	"github.com/google/uuid"
 )
 
+type keychainGCMFactory func(cipher.Block) (cipher.AEAD, error)
+
+var (
+	keychainMkdirAll    = os.MkdirAll
+	keychainWriteFile   = os.WriteFile
+	keychainUserHomeDir = os.UserHomeDir
+	keychainRandRead    = rand.Read
+)
+
 // fileDEK retrieves or generates a Data Encryption Key stored as a plain
 // file under the platform storage directory. Shared by Linux (default) and
-// the macOS sandbox fallback path (DWS_DISABLE_KEYCHAIN=1).
+// the macOS sandbox fallback path (DWS_DISABLE_KEYCHAIN=1) and OpenHarmony.
 func fileDEK(service string) ([]byte, error) {
 	dir := StorageDir(service)
 	keyPath := filepath.Join(dir, "dek")
 
-	key, err := os.ReadFile(keyPath)
+	key, err := keychainReadFile(keyPath)
 	if err == nil && len(key) == dekBytes {
 		return key, nil
 	}
 
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := keychainMkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create keychain dir: %w", err)
 	}
 
 	key = make([]byte, dekBytes)
-	if _, err := rand.Read(key); err != nil {
+	if _, err := keychainRandRead(key); err != nil {
 		return nil, fmt.Errorf("generate dek: %w", err)
 	}
 
 	tmpKeyPath := filepath.Join(dir, "dek."+uuid.New().String()+".tmp")
-	defer os.Remove(tmpKeyPath)
+	defer keychainRemove(tmpKeyPath)
 
-	if err := os.WriteFile(tmpKeyPath, key, 0600); err != nil {
+	if err := keychainWriteFile(tmpKeyPath, key, 0600); err != nil {
 		return nil, fmt.Errorf("write dek: %w", err)
 	}
 
-	if err := os.Rename(tmpKeyPath, keyPath); err != nil {
+	if err := keychainRename(tmpKeyPath, keyPath); err != nil {
 		// If rename fails, another process might have created it. Try reading again.
-		existingKey, readErr := os.ReadFile(keyPath)
+		existingKey, readErr := keychainReadFile(keyPath)
 		if readErr == nil && len(existingKey) == dekBytes {
 			return existingKey, nil
 		}
@@ -62,4 +72,23 @@ func fileDEK(service string) ([]byte, error) {
 	}
 
 	return key, nil
+}
+
+func fileDEKReadOnly(service string) ([]byte, error) {
+	keyPath := filepath.Join(StorageDir(service), "dek")
+	key, err := keychainReadFile(keyPath)
+	if err == nil && len(key) == dekBytes {
+		return key, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrDEKMissing
+		}
+		return nil, fmt.Errorf("read dek: %w", err)
+	}
+	return nil, fmt.Errorf("read dek: %w", ErrDEKMissing)
+}
+
+func fileDEKCiphertextMismatchError() error {
+	return fmt.Errorf("%w: file-DEK cannot decrypt existing entry", ErrCiphertextKeyMismatch)
 }

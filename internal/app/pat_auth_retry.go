@@ -14,6 +14,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	stderrors "errors"
@@ -32,8 +33,9 @@ import (
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pat"
-	"github.com/fatih/color"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/tui"
 )
 
 const (
@@ -46,9 +48,29 @@ const (
 	PatAuthPollInterval = 5 * time.Second
 
 	patScopeAuthRequiredCode = "PAT_SCOPE_AUTH_REQUIRED"
+	patOrgPolicyDeniedCode   = "PAT_ORG_POLICY_DENIED"
 )
 
 var openBrowserFunc = tryOpenBrowser
+
+var (
+	patAuthorizationTimeout       = PatAuthRetryTimeout
+	patAuthorizationPollInterval  = PatAuthPollInterval
+	patResolveAccessToken         = ResolveAuxiliaryAccessToken
+	patWaitForAuthorization       = WaitForPatAuthorization
+	patPollDeviceFlowWithInterval = pollPatDeviceFlowWithInterval
+	patSaveAppConfig              = authpkg.SaveAppConfig
+	patExchangeCodeForToken       = authpkg.ExchangeCodeForToken
+	patSaveTokenData              = authpkg.SaveLoginTokenData
+	patSleep                      = time.Sleep
+	patPollHTTPDo                 = (*http.Client).Do
+	patPollNewRequest             = http.NewRequestWithContext
+	patBrowserOpenCommand         = browserOpenCommand
+)
+
+type patSuppressBrowserOpenKeyType struct{}
+
+var patSuppressBrowserOpenKey = patSuppressBrowserOpenKeyType{}
 
 // PatScopeError holds information about a missing PAT scope.
 type PatScopeError struct {
@@ -65,10 +87,11 @@ func (e *PatScopeError) Error() string {
 }
 
 // patScopeRegex matches PAT-protocol scope error patterns from the API.
-// Only matches explicit scope-related keywords; generic "permission denied" or
-// "forbidden" are intentionally excluded to avoid false positives on business
-// authorization errors (e.g. mailbox access denied, 403 Forbidden).
-var patScopeRegex = regexp.MustCompile(`(?i)(missing_scope|insufficient_scope|scope.*required)`)
+// Only matches explicit PAT protocol markers. Generic "permission denied",
+// "forbidden", and business prose like "scope approval required" are
+// intentionally excluded: they also appear on business authorization errors,
+// and rerouting those into PAT re-auth would replay the original call.
+var patScopeRegex = regexp.MustCompile(`(?i)(missing_scope|insufficient_scope)`)
 
 // scopeValueRegex extracts a scope identifier (e.g. "calendar:read",
 // "mail:user_mailbox.message:send") from an error message.
@@ -93,16 +116,21 @@ func isPatScopeError(err error) bool {
 
 	var typed *apperrors.Error
 	if stderrors.As(err, &typed) {
-		// Check message, reason, and hint for scope-related patterns
+		// Explicit PAT protocol markers are strong evidence anywhere they appear.
 		fullText := strings.ToLower(typed.Message + " " + typed.Reason + " " + typed.Hint)
-		if typed.Category == apperrors.CategoryAuth {
-			if strings.Contains(fullText, "missing_scope") || strings.Contains(fullText, "insufficient_scope") ||
-				(strings.Contains(fullText, "scope") && strings.Contains(fullText, "required")) {
-				return true
-			}
-		}
-		// Any category with scope/permission hints
 		if strings.Contains(fullText, "missing_scope") || strings.Contains(fullText, "insufficient_scope") {
+			return true
+		}
+		// The looser "scope ... required" shape is only PAT evidence when the
+		// error's own message/reason carries it AND names a scope value
+		// (e.g. "calendar:read"). Business prose like "application scope
+		// approval required" — whether in a server hint or the message —
+		// must not reroute a business authorization denial into the PAT
+		// re-auth (and replay) path.
+		protocolText := strings.ToLower(typed.Message + " " + typed.Reason)
+		if typed.Category == apperrors.CategoryAuth &&
+			strings.Contains(protocolText, "scope") && strings.Contains(protocolText, "required") &&
+			scopeValueRegex.MatchString(protocolText) {
 			return true
 		}
 	}
@@ -152,36 +180,31 @@ func extractPatScopeError(err error) *PatScopeError {
 
 // PrintPatAuthError prints a human-readable PAT authorization error.
 func PrintPatAuthError(w io.Writer, scopeErr *PatScopeError) {
-	bold := color.New(color.Bold).SprintFunc()
-	cyan := color.New(color.FgCyan).SprintFunc()
-	dim := color.New(color.Faint).SprintFunc()
-	green := color.New(color.FgGreen).SprintFunc()
-
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "{\n")
-	fmt.Fprintf(w, "  %s: %s,\n", bold("\"ok\""), "false")
-	fmt.Fprintf(w, "  %s: %q,\n", bold("\"identity\""), scopeErr.Identity)
-	fmt.Fprintf(w, "  %s: {\n", bold("\"error\""))
-	fmt.Fprintf(w, "    %s: %q,\n", bold("\"type\""), scopeErr.ErrorType)
-	fmt.Fprintf(w, "    %s: %q,\n", bold("\"message\""), scopeErr.Message)
-	fmt.Fprintf(w, "    %s: %q\n", bold("\"hint\""), scopeErr.Hint)
+	fmt.Fprintf(w, "  %s: %s,\n", tui.Bold("\"ok\""), "false")
+	fmt.Fprintf(w, "  %s: %q,\n", tui.Bold("\"identity\""), scopeErr.Identity)
+	fmt.Fprintf(w, "  %s: {\n", tui.Bold("\"error\""))
+	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"type\""), scopeErr.ErrorType)
+	fmt.Fprintf(w, "    %s: %q,\n", tui.Bold("\"message\""), scopeErr.Message)
+	fmt.Fprintf(w, "    %s: %q\n", tui.Bold("\"hint\""), scopeErr.Hint)
 	fmt.Fprintf(w, "  }\n")
 	fmt.Fprintf(w, "}\n")
 	fmt.Fprintln(w)
 
 	// Print authorization instructions
-	fmt.Fprintf(w, "%s %s\n", green("▶"), bold("需要额外授权"))
+	fmt.Fprintf(w, "%s %s\n", tui.StateMark("warning"), tui.Bold("需要额外授权"))
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  %s %s\n", dim("#"), dim("运行以下命令完成授权"))
+	fmt.Fprintf(w, "  %s %s\n", tui.Dim("#"), tui.Dim("运行以下命令完成授权"))
 
 	if scopeErr.MissingScope != "" {
-		fmt.Fprintf(w, "  %s %s\n", cyan("$"), cyan(fmt.Sprintf("dws auth login --scope %q", scopeErr.MissingScope)))
+		fmt.Fprintf(w, "  %s %s\n", tui.Cyan("$"), tui.Cyan(fmt.Sprintf("dws auth login --scope %q", scopeErr.MissingScope)))
 	} else {
-		fmt.Fprintf(w, "  %s %s\n", cyan("$"), cyan("dws auth login"))
+		fmt.Fprintf(w, "  %s %s\n", tui.Cyan("$"), tui.Cyan("dws auth login"))
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  %s 在浏览器中打开授权链接，完成授权后重新执行命令\n", dim("ℹ"))
+	fmt.Fprintf(w, "  %s 在浏览器中打开授权链接，完成授权后重新执行命令\n", tui.Dim("ℹ"))
 	fmt.Fprintln(w)
 }
 
@@ -205,7 +228,10 @@ func wantsStructuredPATOutputFromRunner(runner executor.Runner) bool {
 	return wantsStructuredPATOutput(rr)
 }
 
-func currentPATOpenBrowser(configDir string) bool {
+func currentPATOpenBrowser(ctx context.Context, configDir string) bool {
+	if suppressed, _ := ctx.Value(patSuppressBrowserOpenKey).(bool); suppressed {
+		return false
+	}
 	return pat.EffectiveOpenBrowser(configDir)
 }
 
@@ -224,70 +250,77 @@ func enrichPATErrorWithOpenBrowser(raw string, openBrowser bool) string {
 		data = map[string]any{}
 		payload["data"] = data
 	}
-	if rawURI, ok := data["uri"].(string); ok && strings.TrimSpace(rawURI) != "" {
-		data["authorizationUrl"] = apperrors.PATAuthorizationURL(rawURI)
+	if rawURI := patAuthorizationURIFromData(data); rawURI != "" {
+		authURL := apperrors.PATAuthorizationURL(rawURI)
+		data["uri"] = authURL
+		delete(data, "authUrl")
+		delete(data, "authorizationUrl")
 	}
-	data["openBrowser"] = openBrowser
+	if code, _ := payload["code"].(string); code == "PAT_ORG_POLICY_DENIED" {
+		data["openBrowser"] = false
+	} else {
+		data["openBrowser"] = openBrowser
+	}
 
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return raw
-	}
+	encoded, _ := marshalSingleLineJSONNoHTMLEscape(payload)
 	return string(encoded)
+}
+
+func patAuthorizationURIFromData(data map[string]any) string {
+	for _, key := range []string{"uri", "authUrl", "authorizationUrl"} {
+		value, _ := data[key].(string)
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // WaitForPatAuthorization polls until the user completes authorization or timeout.
 // It returns true if authorization was completed, false if timed out or cancelled.
-func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Writer) bool {
-	bold := color.New(color.Bold).SprintFunc()
-	yellow := color.New(color.FgYellow).SprintFunc()
-	green := color.New(color.FgGreen).SprintFunc()
-	red := color.New(color.FgRed).SprintFunc()
-	dim := color.New(color.Faint).SprintFunc()
-
-	timeout := PatAuthRetryTimeout
+func WaitForPatAuthorization(ctx context.Context, configDir string, output io.Writer) (bool, error) {
+	timeout := patAuthorizationTimeout
 	deadline := time.Now().Add(timeout)
-	pollTicker := time.NewTicker(PatAuthPollInterval)
+	pollTicker := time.NewTicker(patAuthorizationPollInterval)
 	defer pollTicker.Stop()
 	start := time.Now()
 
 	fmt.Fprintln(output)
-	fmt.Fprintf(output, "%s %s\n", yellow("⏳"), bold("等待用户授权..."))
-	fmt.Fprintf(output, "  %s 请在另一个终端完成 dws auth login 授权\n", dim("ℹ"))
-	fmt.Fprintf(output, "  %s 超时时间: %s\n", dim("⏱"), timeout)
+	fmt.Fprintf(output, "%s %s\n", tui.StateMark("pending"), tui.Bold("等待用户授权..."))
+	fmt.Fprintf(output, "  %s 请在另一个终端完成 dws auth login 授权\n", tui.Dim("ℹ"))
+	fmt.Fprintf(output, "  %s 超时时间: %s\n", tui.Dim("⏱"), timeout)
 	fmt.Fprintln(output)
 
 	pollCount := 0
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(output, "%s 操作已取消\n", red("✗"))
-			return false
+			fmt.Fprintf(output, "%s 操作已取消\n", tui.StateMark("error"))
+			return false, ctx.Err()
 
 		case <-time.After(time.Until(deadline)):
-			fmt.Fprintf(output, "%s 等待授权超时 (%s)\n", red("✗"), timeout)
-			fmt.Fprintf(output, "  %s 请重新执行命令\n", dim("ℹ"))
-			return false
+			fmt.Fprintf(output, "%s 等待授权超时 (%s)\n", tui.StateMark("error"), timeout)
+			fmt.Fprintf(output, "  %s 请重新执行命令\n", tui.Dim("ℹ"))
+			return false, nil
 
 		case <-pollTicker.C:
 			pollCount++
 			elapsed := time.Since(start).Truncate(time.Second)
 			remaining := time.Until(deadline).Truncate(time.Second)
 
-			// Check if token is now valid
-			tokenData, err := authpkg.LoadTokenData(configDir)
-			if err == nil && tokenData != nil {
-				if tokenData.IsAccessTokenValid() || tokenData.IsRefreshTokenValid() {
-					fmt.Fprintf(output, "\r%s %s (%s 已用, %s 剩余)          \n",
-						green("✓"), bold("授权成功!"), elapsed, remaining)
-					fmt.Fprintln(output)
-					return true
-				}
+			// Check the same resolver used by every outbound bearer request.
+			if _, err := patResolveAccessToken(ctx, configDir, ""); err == nil {
+				fmt.Fprintf(output, "\r%s %s (%s 已用, %s 剩余)          \n",
+					tui.StateMark("ok"), tui.Bold("授权成功!"), elapsed, remaining)
+				fmt.Fprintln(output)
+				return true, nil
+			} else if !stderrors.Is(err, authpkg.ErrTokenDataNotFound) {
+				return false, fmt.Errorf("check authorization token: %w", err)
 			}
 
 			// Show polling status
 			fmt.Fprintf(output, "\r%s [%d] 等待授权中... (%s 已用, %s 剩余)          ",
-				dim("⟳"), pollCount, elapsed, remaining)
+				tui.Dim("⟳"), pollCount, elapsed, remaining)
 		}
 	}
 }
@@ -312,7 +345,10 @@ func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocati
 	PrintPatAuthError(output, scopeErr)
 
 	// Wait for user to complete authorization
-	authorized := WaitForPatAuthorization(ctx, configDir, output)
+	authorized, waitErr := patWaitForAuthorization(ctx, configDir, output)
+	if waitErr != nil {
+		return executor.Result{}, waitErr
+	}
 	if !authorized {
 		return executor.Result{}, apperrors.NewAuth(
 			"等待用户授权超时",
@@ -327,8 +363,7 @@ func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocati
 
 	// Retry the invocation
 	fmt.Fprintln(output)
-	fmt.Fprintf(output, "%s %s\n", color.New(color.FgGreen).SprintFunc()("▶"),
-		color.New(color.Bold).SprintFunc()("授权完成，正在重试..."))
+	fmt.Fprintf(output, "%s %s\n", tui.StateMark("ok"), tui.Bold("授权完成，正在重试..."))
 	fmt.Fprintln(output)
 
 	return runner.Run(ctx, invocation)
@@ -339,6 +374,9 @@ func retryWithPatAuthRetry(ctx context.Context, runner executor.Runner, invocati
 const (
 	// patPollInterval is how often we poll the device flow status endpoint.
 	patPollInterval = 2 * time.Second
+	// patMaxPollInterval caps a server-provided poll interval so a malformed
+	// response cannot make the CLI look permanently stuck.
+	patMaxPollInterval = 30 * time.Second
 	// patPollTimeout is the maximum time to wait for user authorization via device flow.
 	patPollTimeout = 10 * time.Minute
 )
@@ -348,6 +386,12 @@ const (
 type patRetryingKeyType struct{}
 
 var patRetryingKey = patRetryingKeyType{}
+
+type patRetryRunnerFunc func(context.Context, executor.Invocation) (executor.Result, error)
+
+func (f patRetryRunnerFunc) Run(ctx context.Context, invocation executor.Invocation) (executor.Result, error) {
+	return f(ctx, invocation)
+}
 
 // IsPatRetrying returns true if the current context is already in a PAT retry.
 func IsPatRetrying(ctx context.Context) bool {
@@ -363,8 +407,8 @@ func openPATAuthorizationURI(rawURI string) error {
 	}
 	// The PAT service returns the complete authorization URL. Treat it as an
 	// opaque string unless it is the known legacy DingTalk hash-route variant.
-	// That variant is normalized by the PAT error contract helper while still
-	// preserving the original data.uri in structured output.
+	// That variant is normalized by the PAT error contract helper before being
+	// printed, opened, or returned in structured output.
 	return openBrowserFunc(apperrors.PATAuthorizationURL(rawURI))
 }
 
@@ -379,6 +423,70 @@ func printPATPollDebugResponse(output io.Writer, statusCode int, body []byte) {
 	fmt.Fprintln(output)
 	fmt.Fprintf(output, "  ℹ PAT 轮询接口返回原文 (HTTP %d):\n", statusCode)
 	fmt.Fprintf(output, "    %s\n", trimmed)
+}
+
+func runDirectPATAuthCheck(
+	ctx context.Context,
+	globalFlags *GlobalFlags,
+	patErr *apperrors.PATError,
+	retry func(context.Context) error,
+	output io.Writer,
+) error {
+	if retry == nil {
+		return patErr
+	}
+	return runDirectPATAuthCheckWithMode(ctx, globalFlags, patErr, retry, output, true)
+}
+
+func runDirectPATAuthCheckWaitOnly(
+	ctx context.Context,
+	globalFlags *GlobalFlags,
+	patErr *apperrors.PATError,
+	output io.Writer,
+) error {
+	ctx = context.WithValue(ctx, patSuppressBrowserOpenKey, true)
+	return runDirectPATAuthCheckWithMode(ctx, globalFlags, patErr, nil, output, false)
+}
+
+func runDirectPATAuthCheckWithMode(
+	ctx context.Context,
+	globalFlags *GlobalFlags,
+	patErr *apperrors.PATError,
+	retry func(context.Context) error,
+	output io.Writer,
+	retryAfterApproval bool,
+) error {
+	if retryAfterApproval && retry == nil {
+		return patErr
+	}
+	runner := &runtimeRunner{
+		globalFlags: globalFlags,
+		fallback: patRetryRunnerFunc(func(retryCtx context.Context, invocation executor.Invocation) (executor.Result, error) {
+			if retry != nil {
+				if err := retry(retryCtx); err != nil {
+					return executor.Result{}, err
+				}
+			}
+			invocation.Implemented = true
+			return executor.Result{
+				Invocation: invocation,
+				Response: map[string]any{
+					"ok": true,
+				},
+			}, nil
+		}),
+	}
+	_, err := handlePatAuthCheck(ctx, runner, executor.Invocation{
+		Kind:             "direct_pat_authorization",
+		Stage:            "auth_login_recommend",
+		CanonicalProduct: defaultPATProductID,
+		Tool:             "pat.batch_grant",
+		CanonicalPath:    "pat.batch_grant",
+		Params: map[string]any{
+			"retryAfterApproval": retryAfterApproval,
+		},
+	}, patErr, defaultConfigDir(), output)
+	return err
 }
 
 // handlePatAuthCheck is called by runner.executeInvocation when a PAT
@@ -398,15 +506,33 @@ func handlePatAuthCheck(
 	var patData struct {
 		Code string `json:"code"`
 		Data struct {
-			Desc         string `json:"desc"`
-			FlowID       string `json:"flowId"`
-			URI          string `json:"uri"`
-			ClientID     string `json:"clientId"`
-			ClientSecret string `json:"clientSecret"`
+			Desc             string `json:"desc"`
+			FlowID           string `json:"flowId"`
+			URI              string `json:"uri"`
+			AuthURL          string `json:"authUrl"`
+			AuthorizationURL string `json:"authorizationUrl"`
+			ClientID         string `json:"clientId"`
+			ClientSecret     string `json:"clientSecret"`
+			PollIntervalSecs int    `json:"pollIntervalSeconds"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(patErr.RawJSON), &patData); err != nil {
 		return executor.Result{}, patErr
+	}
+	if patData.Data.URI == "" {
+		patData.Data.URI = patData.Data.AuthURL
+	}
+	if patData.Data.URI == "" {
+		patData.Data.URI = patData.Data.AuthorizationURL
+	}
+	// Organization-policy denial is terminal until an administrator changes
+	// the policy. Return it before reading browser policy, mutating process-wide
+	// credentials, opening a browser, polling, or retrying the invocation even
+	// when a lenient backend also supplies active-flow fields.
+	if patData.Code == patOrgPolicyDeniedCode {
+		return executor.Result{}, &apperrors.PATError{
+			RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, false),
+		}
 	}
 
 	slog.Debug("PAT auth check",
@@ -415,7 +541,7 @@ func handlePatAuthCheck(
 		"hasSecret", patData.Data.ClientSecret != "",
 	)
 	hostOwnedPAT := authpkg.HostOwnsPATFlow()
-	openBrowser := currentPATOpenBrowser(configDir)
+	openBrowser := currentPATOpenBrowser(ctx, configDir)
 	slog.Debug("pat.host_owned_decision",
 		"site", "handlePatAuthCheck",
 		"hostOwned", hostOwnedPAT,
@@ -430,8 +556,7 @@ func handlePatAuthCheck(
 			// When both clientId and clientSecret are provided, use direct mode
 			// (DingTalk API) rather than MCP proxy — the MCP proxy does not hold
 			// the secret for this particular app.
-			authpkg.SetClientID(patData.Data.ClientID)
-			authpkg.SetClientSecret(patData.Data.ClientSecret)
+			authpkg.SetClientCredentials(patData.Data.ClientID, patData.Data.ClientSecret)
 		} else {
 			// No clientSecret — rely on MCP proxy to manage the secret server-side.
 			authpkg.SetClientIDFromMCP(patData.Data.ClientID)
@@ -449,8 +574,9 @@ func handlePatAuthCheck(
 	// In host-controlled PAT mode (driven solely by DINGTALK_DWS_AGENTCODE),
 	// or when flowId is absent, the CLI returns machine-readable JSON to
 	// stderr and leaves UI/polling/retry to the host. `claw-type` is NOT
-	// used for this decision — it is only forwarded on the wire via
-	// edition.MergeHeaders and surfaced in hostControl for traceability.
+	// used for this decision — its edition-fixed value is forwarded on the
+	// wire and surfaced in hostControl for traceability. DWS_AGENT_PRODUCT
+	// does not affect this PAT contract.
 	if hostOwnedPAT || patData.Data.FlowID == "" {
 		if hostOwnedPAT {
 			return executor.Result{}, &apperrors.PATError{RawJSON: enrichPATErrorForHostControl(patErr.RawJSON)}
@@ -465,48 +591,44 @@ func handlePatAuthCheck(
 		return executor.Result{}, &apperrors.PATError{RawJSON: enrichPATErrorWithOpenBrowser(patErr.RawJSON, openBrowser)}
 	}
 
-	bold := color.New(color.Bold).SprintFunc()
-	cyan := color.New(color.FgCyan).SprintFunc()
-	greenFn := color.New(color.FgGreen).SprintFunc()
-	yellowFn := color.New(color.FgYellow).SprintFunc()
-	redFn := color.New(color.FgRed).SprintFunc()
-	dim := color.New(color.Faint).SprintFunc()
-
 	fmt.Fprintln(output)
-	fmt.Fprintf(output, "%s %s\n", greenFn("▶"), bold("需要 PAT 授权"))
+	fmt.Fprintf(output, "%s %s\n", tui.StateMark("warning"), tui.Bold("需要 PAT 授权"))
 	if patData.Data.Desc != "" {
-		fmt.Fprintf(output, "  %s %s\n", dim("ℹ"), patData.Data.Desc)
+		fmt.Fprintf(output, "  %s %s\n", tui.Dim("ℹ"), patData.Data.Desc)
 	}
 	if patData.Data.URI != "" {
 		authURL := apperrors.PATAuthorizationURL(patData.Data.URI)
-		fmt.Fprintf(output, "  %s 授权链接: %s\n", dim("🔗"), cyan(authURL))
-		fmt.Fprintf(output, "  PAT_AUTHORIZATION_URL=%s\n\n", authURL)
+		fmt.Fprintf(output, "  %s 授权链接: %s\n", tui.Dim("🔗"), authURL)
+		fmt.Fprintln(output)
 		if openBrowser {
 			_ = openPATAuthorizationURI(authURL)
 		}
 	}
 
 	// Poll the device flow status until user authorizes, rejects, or timeout.
-	fmt.Fprintf(output, "%s %s\n", yellowFn("⏳"), bold("等待用户授权..."))
-	fmt.Fprintf(output, "  %s 请在浏览器中完成授权，超时时间: %s\n", dim("ℹ"), patPollTimeout)
+	fmt.Fprintf(output, "%s %s\n", tui.StateMark("pending"), tui.Bold("等待用户授权..."))
+	fmt.Fprintf(output, "  %s 请在浏览器中完成授权，超时时间: %s\n", tui.Dim("ℹ"), patPollTimeout)
 	fmt.Fprintln(output)
 
 	pollCtx, cancel := context.WithTimeout(ctx, patPollTimeout)
 	defer cancel()
 
-	status, authCode, err := pollPatDeviceFlow(pollCtx, patData.Data.FlowID, configDir, output)
+	status, authCode, err := patPollDeviceFlowWithInterval(
+		pollCtx, patData.Data.FlowID, configDir, output,
+		resolvePATPollInterval(patData.Data.PollIntervalSecs),
+	)
 	if err != nil {
-		fmt.Fprintf(output, "%s 轮询授权状态失败: %v\n", redFn("✗"), err)
+		fmt.Fprintf(output, "%s 轮询授权状态失败: %v\n", tui.StateMark("error"), err)
 		return executor.Result{}, patErr
 	}
 
 	switch status {
 	case authpkg.StatusApproved:
-		fmt.Fprintf(output, "%s %s\n", greenFn("✓"), bold("授权成功!"))
+		fmt.Fprintf(output, "%s %s\n", tui.StateMark("ok"), tui.Bold("授权成功!"))
 		fmt.Fprintln(output)
 
 		if appCfg != nil {
-			if err := authpkg.SaveAppConfig(configDir, appCfg); err != nil {
+			if err := patSaveAppConfig(configDir, appCfg); err != nil {
 				slog.Warn("failed to persist approved app config from PAT", "error", err)
 				fmt.Fprintf(output, "  \u26a0 保存应用配置失败: %v (下次启动可能需要重新授权)\n", err)
 			}
@@ -515,14 +637,14 @@ func handlePatAuthCheck(
 		// Exchange authCode for a fresh access token (mirrors device_flow loginOnce).
 		if authCode != "" {
 			slog.Debug("PAT retry: exchanging authCode for token", "hasCode", true)
-			tokenData, exchErr := authpkg.ExchangeCodeForToken(ctx, configDir, authCode)
+			tokenData, exchErr := patExchangeCodeForToken(ctx, configDir, authCode)
 			if exchErr != nil {
 				slog.Warn("PAT retry: exchangeCode failed, retrying with existing token", "error", exchErr)
-				fmt.Fprintf(output, "  %s 换取新 token 失败: %v (将使用现有凭证重试)\n", yellowFn("⚠"), exchErr)
+				fmt.Fprintf(output, "  %s 换取新 token 失败: %v (将使用现有凭证重试)\n", tui.StateMark("warning"), exchErr)
 			} else {
-				if err := authpkg.SaveTokenData(configDir, tokenData); err != nil {
+				if err := patSaveTokenData(configDir, tokenData); err != nil {
 					slog.Warn("PAT retry: failed to save new token", "error", err)
-					fmt.Fprintf(output, "  %s 保存新 token 失败: %v\n", yellowFn("⚠"), err)
+					fmt.Fprintf(output, "  %s 保存新 token 失败: %v\n", tui.StateMark("warning"), err)
 				} else {
 					slog.Debug("PAT retry: token refreshed and saved")
 				}
@@ -532,13 +654,23 @@ func handlePatAuthCheck(
 		// Clear token cache so the new credentials take effect.
 		ResetRuntimeTokenCache()
 
+		if shouldSkipPATRetryAfterApproval(invocation) {
+			invocation.Implemented = true
+			return executor.Result{
+				Invocation: invocation,
+				Response: map[string]any{
+					"ok": true,
+				},
+			}, nil
+		}
+
 		// Workaround: brief delay to let server-side authorization state propagate
 		// before retrying.  Without this the retry may use stale credentials.
 		slog.Debug("PAT retry: waiting for server-side state propagation", "delay", "1s")
-		time.Sleep(1 * time.Second)
+		patSleep(1 * time.Second)
 
 		// Retry the original invocation with pat-retrying flag to prevent recursion.
-		fmt.Fprintf(output, "%s %s\n", greenFn("▶"), bold("授权完成，正在重试..."))
+		fmt.Fprintf(output, "%s %s\n", tui.StateMark("ok"), tui.Bold("授权完成，正在重试..."))
 		fmt.Fprintln(output)
 		slog.Debug("PAT retry: identity env check",
 			"DWS_CLIENT_ID", os.Getenv("DWS_CLIENT_ID"),
@@ -547,7 +679,7 @@ func handlePatAuthCheck(
 		return r.Run(retryCtx, invocation)
 
 	case authpkg.StatusRejected:
-		fmt.Fprintf(output, "%s %s\n", redFn("✗"), bold("用户已拒绝授权"))
+		fmt.Fprintf(output, "%s %s\n", tui.StateMark("error"), tui.Bold("用户已拒绝授权"))
 		return executor.Result{}, apperrors.NewAuth(
 			"用户已拒绝授权",
 			apperrors.WithReason("pat_auth_rejected"),
@@ -555,7 +687,7 @@ func handlePatAuthCheck(
 		)
 
 	case authpkg.StatusExpired:
-		fmt.Fprintf(output, "%s %s\n", redFn("✗"), bold("授权超时"))
+		fmt.Fprintf(output, "%s %s\n", tui.StateMark("error"), tui.Bold("授权超时"))
 		return executor.Result{}, apperrors.NewAuth(
 			"授权超时",
 			apperrors.WithReason("pat_auth_expired"),
@@ -563,7 +695,7 @@ func handlePatAuthCheck(
 		)
 
 	case authpkg.StatusCancelled:
-		fmt.Fprintf(output, "%s %s\n", redFn("✗"), bold("操作已取消"))
+		fmt.Fprintf(output, "%s %s\n", tui.StateMark("error"), tui.Bold("操作已取消"))
 		return executor.Result{}, apperrors.NewAuth(
 			"操作已取消",
 			apperrors.WithReason("pat_auth_cancelled"),
@@ -571,9 +703,21 @@ func handlePatAuthCheck(
 		)
 
 	default:
-		fmt.Fprintf(output, "%s 未知授权状态: %s\n", redFn("✗"), status)
+		fmt.Fprintf(output, "%s 未知授权状态: %s\n", tui.StateMark("error"), status)
 		return executor.Result{}, patErr
 	}
+}
+
+func shouldSkipPATRetryAfterApproval(invocation executor.Invocation) bool {
+	if invocation.Params == nil {
+		return false
+	}
+	value, ok := invocation.Params["retryAfterApproval"]
+	if !ok {
+		return false
+	}
+	retry, ok := value.(bool)
+	return ok && !retry
 }
 
 func enrichPATErrorForHostControl(raw string) string {
@@ -595,10 +739,7 @@ func enrichPATErrorForHostControl(raw string) string {
 	apperrors.ApplyHostMutations(payload)
 
 	// stderr JSON MUST be single-line.
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return raw
-	}
+	encoded, _ := marshalSingleLineJSONNoHTMLEscape(payload)
 	return string(encoded)
 }
 
@@ -629,25 +770,37 @@ func buildPATScopeJSON(scopeErr *PatScopeError, includeHostControl bool) string 
 		"data":    data,
 	}
 	// stderr JSON MUST be single-line.
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return `{"success":false,"code":"PAT_SCOPE_AUTH_REQUIRED"}`
-	}
+	b, _ := jsonutil.Marshal(payload)
 	return string(b)
+}
+
+func marshalSingleLineJSONNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	out := buf.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return out, nil
 }
 
 // pollPatDeviceFlow polls the PAT device flow status endpoint until a terminal
 // state (APPROVED/REJECTED/EXPIRED) is reached or the context is cancelled.
 // Returns the final status string and the authCode (non-empty only on APPROVED).
 func pollPatDeviceFlow(ctx context.Context, flowID string, configDir string, output io.Writer) (string, string, error) {
+	return pollPatDeviceFlowWithInterval(ctx, flowID, configDir, output, patPollInterval)
+}
+
+func pollPatDeviceFlowWithInterval(ctx context.Context, flowID string, configDir string, output io.Writer, interval time.Duration) (string, string, error) {
+	if interval <= 0 {
+		interval = patPollInterval
+	}
 	pollURL := fmt.Sprintf("%s%s?flowId=%s",
 		authpkg.GetMCPBaseURL(), authpkg.DevicePollPath, url.QueryEscape(flowID))
-
-	// Load user access token for the poll request header.
-	var accessToken string
-	if tokenData, err := authpkg.LoadTokenData(configDir); err == nil && tokenData != nil {
-		accessToken = tokenData.AccessToken
-	}
 
 	// Use a client that does NOT follow redirects, so we can detect SSO 302.
 	noRedirectClient := &http.Client{
@@ -656,10 +809,9 @@ func pollPatDeviceFlow(ctx context.Context, flowID string, configDir string, out
 		},
 	}
 
-	ticker := time.NewTicker(patPollInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	dim := color.New(color.Faint).SprintFunc()
 	pollCount := 0
 
 	for {
@@ -671,17 +823,21 @@ func pollPatDeviceFlow(ctx context.Context, flowID string, configDir string, out
 			return authpkg.StatusExpired, "", nil
 		case <-ticker.C:
 			pollCount++
-			fmt.Fprintf(output, "\r%s [%d] 等待授权中...          ", dim("⟳"), pollCount)
+			fmt.Fprintf(output, "\r%s [%d] 等待授权中...          ", tui.Dim("⟳"), pollCount)
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
+			req, err := patPollNewRequest(ctx, http.MethodGet, pollURL, nil)
 			if err != nil {
 				slog.Debug("PAT poll: failed to create request", "error", err)
 				continue
 			}
+			accessToken, tokenErr := patResolveAccessToken(ctx, configDir, "")
+			if tokenErr != nil && !stderrors.Is(tokenErr, authpkg.ErrTokenDataNotFound) {
+				return "", "", fmt.Errorf("resolve PAT poll access token: %w", tokenErr)
+			}
 			if accessToken != "" {
 				req.Header.Set("x-user-access-token", accessToken)
 			}
-			resp, err := noRedirectClient.Do(req)
+			resp, err := patPollHTTPDo(noRedirectClient, req)
 			if err != nil {
 				slog.Debug("PAT poll: request failed", "error", err)
 				continue // transient network error, keep polling
@@ -723,6 +879,17 @@ func pollPatDeviceFlow(ctx context.Context, flowID string, configDir string, out
 	}
 }
 
+func resolvePATPollInterval(seconds int) time.Duration {
+	if seconds <= 0 {
+		return patPollInterval
+	}
+	interval := time.Duration(seconds) * time.Second
+	if interval > patMaxPollInterval {
+		return patMaxPollInterval
+	}
+	return interval
+}
+
 func browserOpenCommand(goos, rawURL string) *exec.Cmd {
 	switch goos {
 	case "darwin":
@@ -738,9 +905,19 @@ func browserOpenCommand(goos, rawURL string) *exec.Cmd {
 
 // tryOpenBrowser opens rawURL in the default browser; errors are silently ignored.
 func tryOpenBrowser(rawURL string) error {
-	cmd := browserOpenCommand(runtime.GOOS, rawURL)
+	cmd := patBrowserOpenCommand(runtime.GOOS, rawURL)
 	if cmd == nil {
 		return nil
 	}
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Wait for process to prevent resource leak
+	// Run in goroutine to avoid blocking browser launch
+	go func() {
+		_ = cmd.Wait()
+	}()
+
+	return nil
 }

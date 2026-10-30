@@ -17,6 +17,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -24,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +34,28 @@ import (
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/configmeta"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 	"github.com/spf13/cobra"
+)
+
+var (
+	skillLoadAccessToken    = loadSkillAccessToken
+	skillDownloadToTmp      = downloadSkillToTmpDir
+	skillHTTPDo             = func(client *http.Client, req *http.Request) (*http.Response, error) { return client.Do(req) }
+	skillNewRequest         = http.NewRequestWithContext
+	skillResolveAccessToken = ResolveAuxiliaryAccessToken
+	skillResolveTargetPath  = resolveSkillTargetPath
+	skillFetchDownloadInfo  = fetchSkillDownloadInfo
+	skillDownloadFile       = downloadSkillFile
+	skillExtractZip         = extractSkillZip
+	skillUserHomeDir        = os.UserHomeDir
+	skillMkdirTemp          = os.MkdirTemp
+	skillCreate             = os.Create
+	skillCreateTemp         = os.CreateTemp
+	skillRemoveAll          = os.RemoveAll
+	skillRemove             = os.Remove
+	skillMkdirAll           = os.MkdirAll
+	skillOpenFile           = os.OpenFile
+	skillCopy               = io.Copy
+	skillOpenZipFile        = func(file *zip.File) (io.ReadCloser, error) { return file.Open() }
 )
 
 func init() {
@@ -47,11 +71,13 @@ func init() {
 const (
 	// legacySkillAPIHost is the legacy skill market host used by the old cli.
 	legacySkillAPIHost = "https://mcp.dingtalk.com"
-	// skillDownloadEndpoint is the API endpoint for downloading skills.
-	skillDownloadEndpoint = "https://aihub.dingtalk.com/cli/download"
 	// skillDownloadTimeout is the timeout for skill download operations.
 	skillDownloadTimeout = 5 * time.Minute
 )
+
+// skillDownloadEndpoint is variable so tests and private distributions can
+// exercise the download flow without contacting the public service.
+var skillDownloadEndpoint = "https://aihub.dingtalk.com/cli/download"
 
 // downloadSkillResponse represents the API response for skill download.
 type downloadSkillResponse struct {
@@ -85,22 +111,173 @@ type CliSkillDTO struct {
 
 // agentSkillPaths maps target names to their relative skill installation paths.
 // These paths are relative to the user's home directory.
+//
+// Source of truth for both `dws skill install <skillId> <target>` and
+// `dws skill setup --target <name>`. Every entry in skillSetupAgentHomes
+// (skill_setup.go) MUST have a matching path value here — enforced by
+// TestAgentSkillPathsCoversSetupHomes.
 var agentSkillPaths = map[string]string{
-	"qoder":    ".qoder/skills",
-	"claude":   ".claude/skills",
-	"cursor":   ".cursor/skills",
-	"codex":    ".codex/skills",
-	"opencode": filepath.Join(".config", "opencode", "skills"),
+	// Universal agents. Those without an independent global directory map
+	// directly to the canonical ~/.agents/skills store.
+	"agents":          ".agents/skills",
+	"amp":             filepath.Join(".config", "agents", "skills"),
+	"antigravity":     ".gemini/antigravity/skills",
+	"antigravity-cli": ".gemini/antigravity-cli/skills",
+	"codex":           ".codex/skills",
+	"cursor":          ".cursor/skills",
+	"deepagents":      ".deepagents/agent/skills",
+	"firebender":      ".firebender/skills",
+	"gemini-cli":      ".gemini/skills",
+	"github-copilot":  ".copilot/skills",
+	"opencode":        filepath.Join(".config", "opencode", "skills"),
+	"replit":          filepath.Join(".config", "agents", "skills"),
+	"universal":       filepath.Join(".config", "agents", "skills"),
+	"cline":           ".agents/skills",
+	"dexto":           ".agents/skills",
+	"kimi-code-cli":   ".agents/skills",
+	"loaf":            ".agents/skills",
+	"warp":            ".agents/skills",
+	"zed":             ".agents/skills",
+
+	// Non-universal agents with global Skill directories.
+	"aider-desk":     ".aider-desk/skills",
+	"astrbot":        ".astrbot/data/skills",
+	"autohand-code":  ".autohand/skills",
+	"augment":        ".augment/skills",
+	"bob":            ".bob/skills",
+	"claude-code":    ".claude/skills",
+	"openclaw":       ".openclaw/skills",
+	"codearts-agent": ".codeartsdoer/skills",
+	"codebuddy":      ".codebuddy/skills",
+	"codemaker":      ".codemaker/skills",
+	"codestudio":     ".codestudio/skills",
+	"command-code":   ".commandcode/skills",
+	"continue":       ".continue/skills",
+	"cortex":         ".snowflake/cortex/skills",
+	"crush":          filepath.Join(".config", "crush", "skills"),
+	"devin":          filepath.Join(".config", "devin", "skills"),
+	"droid":          ".factory/skills",
+	"forgecode":      ".forge/skills",
+	"goose":          filepath.Join(".config", "goose", "skills"),
+	"grok":           ".grok/skills",
+	"hermes-agent":   ".hermes/skills",
+	"inference-sh":   ".inferencesh/skills",
+	"jazz":           ".jazz/skills",
+	"junie":          ".junie/skills",
+	"iflow-cli":      ".iflow/skills",
+	"kilo":           ".kilocode/skills",
+	"kimchi":         filepath.Join(".config", "kimchi", "harness", "skills"),
+	"kiro-cli":       ".kiro/skills",
+	"kode":           ".kode/skills",
+	"lingma":         ".lingma/skills",
+	"mcpjam":         ".mcpjam/skills",
+	"minimax-code":   ".minimax/skills",
+	"mistral-vibe":   ".vibe/skills",
+	"moxby":          ".moxby/skills",
+	"mux":            ".mux/skills",
+	"openhands":      ".openhands/skills",
+	"ona":            ".ona/skills",
+	"pi":             ".pi/agent/skills",
+	"qoder":          ".qoder/skills",
+	"qoder-cn":       ".qoder-cn/skills",
+	"qwen-code":      ".qwen/skills",
+	"reasonix":       ".reasonix/skills",
+	"rovodev":        ".rovodev/skills",
+	"roo":            ".roo/skills",
+	"tabnine-cli":    ".tabnine/agent/skills",
+	"terramind":      ".terramind/skills",
+	"tinycloud":      ".tinycloud/skills",
+	"trae":           ".trae/skills",
+	"trae-cn":        ".trae-cn/skills",
+	"windsurf":       ".codeium/windsurf/skills",
+	"zcode":          ".zcode/skills",
+	"zencoder":       ".zencoder/skills",
+	"zenflow":        ".zencoder/skills",
+	"neovate":        ".neovate/skills",
+	"pochi":          ".pochi/skills",
+	"adal":           ".adal/skills",
+
+	// DWS compatibility aliases and DWS-only integrations.
+	"claude":    ".claude/skills",
+	"gemini":    ".gemini/skills",
+	"github":    ".copilot/skills",
+	"hermes":    ".hermes/skills",
+	"kiro":      ".kiro/skills",
+	"qoderwork": ".qoderwork/skills",
 }
 
-// supportedTargets returns a comma-separated list of supported targets.
+// Eve has project-scoped Skill directories but no upstream globalSkillsDir.
+// Keep it in the advertised enumeration while failing explicitly instead of
+// pretending that a global install configured Eve.
+var unsupportedGlobalAgentTargets = map[string]string{
+	"eve":          "Eve 不支持全局 Skill 安装，请在 Eve 项目内配置 agent/skills",
+	"promptscript": "PromptScript 不支持全局 Skill 安装，请在项目内使用 .agents/skills",
+}
+
+// supportedTargets returns a sorted, comma-separated list of supported
+// targets. Sorted so help text and error messages stay stable across runs
+// (Go map iteration order is intentionally randomized).
 func supportedTargets() string {
-	targets := make([]string, 0, len(agentSkillPaths)+1)
+	targets := make([]string, 0, len(agentSkillPaths)+len(unsupportedGlobalAgentTargets)+1)
 	for target := range agentSkillPaths {
 		targets = append(targets, target)
 	}
+	for target := range unsupportedGlobalAgentTargets {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
 	targets = append(targets, ".")
 	return strings.Join(targets, ", ")
+}
+
+// longestAgentTargetName returns the character count of the longest target
+// name in agentSkillPaths. Used by --help formatting to keep the "." entry
+// vertically aligned with named targets.
+func longestAgentTargetName() int {
+	n := 0
+	for name := range agentSkillPaths {
+		if len(name) > n {
+			n = len(name)
+		}
+	}
+	return n
+}
+
+// formatAgentSkillPathsForHelp renders agentSkillPaths as an aligned
+// "  <name> -> ~/<path>" block, sorted by name, for use in --help output.
+// Keeps `dws skill install --help` in sync with the map without hand-edits.
+func formatAgentSkillPathsForHelp() string {
+	names := make([]string, 0, len(agentSkillPaths))
+	maxWidth := 0
+	for n := range agentSkillPaths {
+		names = append(names, n)
+		if len(n) > maxWidth {
+			maxWidth = len(n)
+		}
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		installPath := agentSkillPaths[n]
+		if isUniversalSkillInstallTarget(n) {
+			installPath = ".agents/skills"
+		}
+		fmt.Fprintf(&b, "  %-*s -> ~/%s/\n", maxWidth, n, installPath)
+	}
+	return b.String()
+}
+
+// Universal Agents discover the shared ~/.agents/skills store directly. A
+// marketplace install addressed to one of those Agent IDs must therefore
+// publish to canonical instead of recreating an Agent-private duplicate.
+func isUniversalSkillInstallTarget(target string) bool {
+	rel, ok := agentSkillPaths[target]
+	if !ok {
+		return false
+	}
+	base := filepath.Join("__home__", rel)
+	canonical := filepath.Join("__home__", ".agents", "skills")
+	return sameSkillSetupPath(base, canonical) || isUniversalSkillSetupBase(base)
 }
 
 func buildSkillCommand() *cobra.Command {
@@ -122,6 +299,7 @@ func buildSkillCommand() *cobra.Command {
 		newSkillSearchCommand(),
 		newSkillFindHintCommand(),
 		newSkillAddHintCommand(),
+		newSkillSetupCommand(),
 	)
 	return cmd
 }
@@ -151,7 +329,9 @@ func newSkillSearchCommand() *cobra.Command {
 	}
 	cmd.Flags().String("query", "", "搜索关键词（必填）")
 	_ = cmd.MarkFlagRequired("query")
-	cmd.Flags().String("scopes", "", "查询范围，空格分隔。备选值：DingtalkMarket（钉钉市场）、OrgInternal（企业内部）。为空默认查市场技能")
+	cmd.Flags().String("source", "", "查询范围，空格分隔。备选值：DingtalkMarket（钉钉市场）、OrgInternal（企业内部）")
+	cmd.Flags().String("scopes", "", "查询范围（已废弃，请使用 --source）")
+	_ = cmd.Flags().MarkDeprecated("scopes", "请使用 --source 替代")
 	return cmd
 }
 
@@ -179,17 +359,15 @@ func newSkillInstallCommand() *cobra.Command {
   target    安装目标（必填），支持: %s
 
 安装路径:
-  qoder    -> ~/.qoder/skills/
-  claude   -> ~/.claude/skills/
-  cursor   -> ~/.cursor/skills/
-  codex    -> ~/.codex/skills/
-  opencode -> ~/.config/opencode/skills/
-  .        -> 当前目录
+%s  .%s -> 当前目录
 
 示例:
-  dws skill install skill-123 qoder     # 安装到 ~/.qoder/skills/
   dws skill install skill-123 claude    # 安装到 ~/.claude/skills/
-  dws skill install skill-123 .         # 安装到当前目录`, supportedTargets()),
+  dws skill install skill-123 qoder     # 安装到 ~/.qoder/skills/
+  dws skill install skill-123 .         # 安装到当前目录`,
+			supportedTargets(),
+			formatAgentSkillPathsForHelp(),
+			strings.Repeat(" ", longestAgentTargetName()-1)),
 		Args:              cobra.ExactArgs(2),
 		DisableAutoGenTag: true,
 		RunE:              runSkillAdd,
@@ -213,7 +391,7 @@ func newSkillAddHintCommand() *cobra.Command {
 
 func runSkillGet(cmd *cobra.Command, args []string) error {
 	skillID, _ := cmd.Flags().GetString("skill-id")
-	accessToken, err := loadSkillAccessToken()
+	accessToken, err := skillLoadAccessToken(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -221,7 +399,7 @@ func runSkillGet(cmd *cobra.Command, args []string) error {
 	apiURL := fmt.Sprintf("%s/cli/install?skillId=%s", skillAPIHost(), url.QueryEscape(strings.TrimSpace(skillID)))
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "⬇️  下载技能包...")
 
-	tmpDir, err := downloadSkillToTmpDir(cmd.Context(), apiURL, accessToken)
+	tmpDir, err := skillDownloadToTmp(cmd.Context(), apiURL, accessToken)
 	if err != nil {
 		return err
 	}
@@ -232,24 +410,27 @@ func runSkillGet(cmd *cobra.Command, args []string) error {
 
 func runSkillFind(cmd *cobra.Command, args []string) error {
 	keyword, _ := cmd.Flags().GetString("query")
-	scopes, _ := cmd.Flags().GetString("scopes")
-	accessToken, err := loadSkillAccessToken()
+	source, _ := cmd.Flags().GetString("source")
+	if source == "" {
+		source, _ = cmd.Flags().GetString("scopes")
+	}
+	accessToken, err := skillLoadAccessToken(cmd.Context())
 	if err != nil {
 		return err
 	}
 
 	apiURL := fmt.Sprintf("%s/cli/find-skills?keyword=%s", skillAPIHost(), url.QueryEscape(strings.TrimSpace(keyword)))
-	if scopes != "" {
-		apiURL += "&scopes=" + url.QueryEscape(scopes)
+	if source != "" {
+		apiURL += "&source=" + url.QueryEscape(source)
 	}
-	req, err := http.NewRequestWithContext(cmd.Context(), http.MethodGet, apiURL, nil)
+	req, err := skillNewRequest(cmd.Context(), http.MethodGet, apiURL, nil)
 	if err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to create request: %v", err))
 	}
 	req.Header.Set("x-user-access-token", accessToken)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := skillHTTPDo(client, req)
 	if err != nil {
 		return apperrors.NewAPI(fmt.Sprintf("failed to search skills: %v", err), apperrors.WithRetryable(true))
 	}
@@ -297,12 +478,12 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Resolve target path
-	destPath, err := resolveSkillTargetPath(target)
+	destPath, err := skillResolveTargetPath(target)
 	if err != nil {
 		return apperrors.NewValidation(fmt.Sprintf("invalid target '%s': %v. Supported targets: %s", target, err, supportedTargets()))
 	}
 
-	accessToken, err := loadSkillAccessToken()
+	accessToken, err := skillLoadAccessToken(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -314,7 +495,7 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Get download URL from API
 	fmt.Fprintf(w, "正在获取技能信息...\n")
-	downloadResp, err := fetchSkillDownloadInfo(ctx, accessToken, skillID)
+	downloadResp, err := skillFetchDownloadInfo(ctx, accessToken, skillID)
 	if err != nil {
 		return err
 	}
@@ -337,7 +518,7 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 
 	// Step 2: Download the skill zip file
 	fmt.Fprintf(w, "正在下载技能...\n")
-	tempZipPath, err := downloadSkillFile(ctx, downloadResp.Result.DownloadURL, downloadResp.Result.FileName)
+	tempZipPath, err := skillDownloadFile(ctx, downloadResp.Result.DownloadURL, downloadResp.Result.FileName)
 	if err != nil {
 		return err
 	}
@@ -345,7 +526,7 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 
 	// Step 3: Extract zip to destination
 	fmt.Fprintf(w, "正在解压到 %s...\n", destPath)
-	if err := extractSkillZip(tempZipPath, destPath); err != nil {
+	if err := skillExtractZip(tempZipPath, destPath); err != nil {
 		return err
 	}
 
@@ -355,13 +536,16 @@ func runSkillAdd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func loadSkillAccessToken() (string, error) {
+func loadSkillAccessToken(ctx context.Context) (string, error) {
 	configDir := defaultConfigDir()
-	tokenData, err := authpkg.LoadTokenData(configDir)
-	if err != nil || tokenData == nil || !tokenData.IsAccessTokenValid() {
+	token, err := skillResolveAccessToken(ctx, configDir, "")
+	if errors.Is(err, authpkg.ErrTokenDataNotFound) {
 		return "", skillAuthError()
 	}
-	return tokenData.AccessToken, nil
+	if err != nil {
+		return "", fmt.Errorf("resolve skill access token: %w", err)
+	}
+	return token, nil
 }
 
 func skillAuthError() error {
@@ -394,25 +578,34 @@ func resolveSkillTargetPath(target string) (string, error) {
 		return os.Getwd()
 	}
 
-	// Look up predefined agent paths
-	relPath, ok := agentSkillPaths[strings.ToLower(target)]
+	target = strings.ToLower(target)
+	if reason, unsupported := unsupportedGlobalAgentTargets[target]; unsupported {
+		return "", errors.New(reason)
+	}
+
+	// Look up predefined agent paths.
+	_, ok := agentSkillPaths[target]
 	if !ok {
 		return "", fmt.Errorf("unsupported target")
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := skillUserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	return filepath.Join(homeDir, relPath), nil
+	destination := resolveSkillSetupBase(homeDir, target)
+	if isUniversalSkillInstallTarget(target) {
+		destination = filepath.Join(homeDir, ".agents", "skills")
+	}
+	return destination, nil
 }
 
 // fetchSkillDownloadInfo calls the download API to get the skill download URL.
 func fetchSkillDownloadInfo(ctx context.Context, accessToken, skillID string) (*downloadSkillResponse, error) {
 	url := fmt.Sprintf("%s?skillId=%s", skillDownloadEndpoint, skillID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := skillNewRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, apperrors.NewInternal(fmt.Sprintf("failed to create request: %v", err))
 	}
@@ -421,7 +614,7 @@ func fetchSkillDownloadInfo(ctx context.Context, accessToken, skillID string) (*
 	req.Header.Set("x-user-access-token", accessToken)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := skillHTTPDo(client, req)
 	if err != nil {
 		return nil, apperrors.NewAPI(fmt.Sprintf("failed to call download API: %v", err),
 			apperrors.WithRetryable(true))
@@ -451,14 +644,14 @@ func fetchSkillDownloadInfo(ctx context.Context, accessToken, skillID string) (*
 }
 
 func downloadSkillToTmpDir(ctx context.Context, apiURL, accessToken string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	req, err := skillNewRequest(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to create request: %v", err))
 	}
 	req.Header.Set("x-user-access-token", accessToken)
 
 	client := &http.Client{Timeout: skillDownloadTimeout}
-	resp, err := client.Do(req)
+	resp, err := skillHTTPDo(client, req)
 	if err != nil {
 		return "", apperrors.NewAPI(fmt.Sprintf("failed to download skill package: %v", err), apperrors.WithRetryable(true))
 	}
@@ -468,22 +661,22 @@ func downloadSkillToTmpDir(ctx context.Context, apiURL, accessToken string) (str
 		return "", parseLegacySkillAPIError(resp)
 	}
 
-	tmpDir, err := os.MkdirTemp("", "dws-skill-*")
+	tmpDir, err := skillMkdirTemp("", "dws-skill-*")
 	if err != nil {
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to create temp dir: %v", err))
 	}
 
 	filename := filenameFromDisposition(resp.Header.Get("Content-Disposition"))
 	destPath := filepath.Join(tmpDir, filename)
-	file, err := os.Create(destPath)
+	file, err := skillCreate(destPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = skillRemoveAll(tmpDir)
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to create temp file: %v", err))
 	}
 	defer file.Close()
 
-	if _, err := io.Copy(file, resp.Body); err != nil {
-		os.RemoveAll(tmpDir)
+	if _, err := skillCopy(file, resp.Body); err != nil {
+		_ = skillRemoveAll(tmpDir)
 		return "", apperrors.NewAPI(fmt.Sprintf("failed to save downloaded file: %v", err))
 	}
 	return tmpDir, nil
@@ -516,13 +709,13 @@ func parseLegacySkillAPIError(resp *http.Response) error {
 
 // downloadSkillFile downloads the skill zip file to a temporary location.
 func downloadSkillFile(ctx context.Context, downloadURL, fileName string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	req, err := skillNewRequest(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to create download request: %v", err))
 	}
 
 	client := &http.Client{Timeout: skillDownloadTimeout}
-	resp, err := client.Do(req)
+	resp, err := skillHTTPDo(client, req)
 	if err != nil {
 		return "", apperrors.NewAPI(fmt.Sprintf("failed to download skill: %v", err),
 			apperrors.WithRetryable(true))
@@ -538,21 +731,21 @@ func downloadSkillFile(ctx context.Context, downloadURL, fileName string) (strin
 	if fileName == "" {
 		fileName = "skill.zip"
 	}
-	tempFile, err := os.CreateTemp("", "dws-skill-*.zip")
+	tempFile, err := skillCreateTemp("", "dws-skill-*.zip")
 	if err != nil {
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to create temp file: %v", err))
 	}
 	tempPath := tempFile.Name()
 
 	// Copy response body to temp file
-	_, err = io.Copy(tempFile, resp.Body)
+	_, err = skillCopy(tempFile, resp.Body)
 	closeErr := tempFile.Close()
 	if err != nil {
-		os.Remove(tempPath)
+		_ = skillRemove(tempPath)
 		return "", apperrors.NewAPI(fmt.Sprintf("failed to save downloaded file: %v", err))
 	}
 	if closeErr != nil {
-		os.Remove(tempPath)
+		_ = skillRemove(tempPath)
 		return "", apperrors.NewInternal(fmt.Sprintf("failed to close temp file: %v", closeErr))
 	}
 
@@ -562,7 +755,7 @@ func downloadSkillFile(ctx context.Context, downloadURL, fileName string) (strin
 // extractSkillZip extracts a zip file to the destination directory.
 func extractSkillZip(zipPath, destDir string) error {
 	// Ensure destination directory exists
-	if err := os.MkdirAll(destDir, 0755); err != nil {
+	if err := skillMkdirAll(destDir, 0755); err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to create destination directory: %v", err))
 	}
 
@@ -591,16 +784,16 @@ func extractZipFile(file *zip.File, destDir string) error {
 
 	if file.FileInfo().IsDir() {
 		// Use 0755 to ensure we have write permission for creating files inside
-		return os.MkdirAll(filePath, 0755)
+		return skillMkdirAll(filePath, 0755)
 	}
 
 	// Ensure parent directory exists with write permission
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+	if err := skillMkdirAll(filepath.Dir(filePath), 0755); err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to create directory: %v", err))
 	}
 
 	// Extract file
-	srcFile, err := file.Open()
+	srcFile, err := skillOpenZipFile(file)
 	if err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to open file in zip: %v", err))
 	}
@@ -611,13 +804,13 @@ func extractZipFile(file *zip.File, destDir string) error {
 	if fileMode&0600 == 0 {
 		fileMode = 0644
 	}
-	destFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
+	destFile, err := skillOpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
 	if err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to create file: %v", err))
 	}
 	defer destFile.Close()
 
-	if _, err := io.Copy(destFile, srcFile); err != nil {
+	if _, err := skillCopy(destFile, srcFile); err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to extract file: %v", err))
 	}
 
@@ -627,6 +820,6 @@ func extractZipFile(file *zip.File, destDir string) error {
 // cleanupTempFile removes a temporary file, ignoring errors.
 func cleanupTempFile(path string) {
 	if path != "" {
-		os.Remove(path)
+		_ = skillRemove(path)
 	}
 }

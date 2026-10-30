@@ -14,15 +14,19 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/market"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/mcptypes"
 )
+
+const maxPluginCLIOverlayBytes = 4 << 20
 
 // UserContext holds the minimal user identity fields injected into
 // stdio plugin subprocesses via environment variables.
@@ -96,11 +100,11 @@ func expandPluginVars(s, root string) string {
 }
 
 // ToServerDescriptors converts a loaded plugin's MCP servers into
-// market.ServerDescriptor values suitable for SetDynamicServers.
+// mcptypes.ServerDescriptor values suitable for SetDynamicServers.
 // Only streamable-http servers are converted; stdio servers are
 // skipped (they require the stdio transport extension).
-func (p *Plugin) ToServerDescriptors() []market.ServerDescriptor {
-	var descriptors []market.ServerDescriptor
+func (p *Plugin) ToServerDescriptors() []mcptypes.ServerDescriptor {
+	var descriptors []mcptypes.ServerDescriptor
 	for key, srv := range p.Manifest.MCPServers {
 		if srv.Type != "streamable-http" {
 			slog.Debug("plugin: skipping non-http server",
@@ -111,23 +115,9 @@ func (p *Plugin) ToServerDescriptors() []market.ServerDescriptor {
 			continue
 		}
 
-		overlay := market.CLIOverlay{}
-		if len(srv.CLI) > 0 {
-			if err := json.Unmarshal(srv.CLI, &overlay); err != nil {
-				slog.Warn("plugin: failed to parse CLIOverlay",
-					"plugin", p.Manifest.Name,
-					"server", key,
-					"error", err,
-				)
-			}
-		}
-
-		// Ensure the overlay has an ID — fall back to server key.
-		if overlay.ID == "" {
-			overlay.ID = key
-		}
-		if overlay.Command == "" {
-			overlay.Command = key
+		overlay, ok := p.ResolveCLIOverlay(key)
+		if !ok {
+			continue
 		}
 
 		source := "plugin"
@@ -141,7 +131,7 @@ func (p *Plugin) ToServerDescriptors() []market.ServerDescriptor {
 			}
 		}
 
-		descriptors = append(descriptors, market.ServerDescriptor{
+		descriptors = append(descriptors, mcptypes.ServerDescriptor{
 			Key:         key,
 			DisplayName: p.Manifest.Name + "/" + key,
 			Description: p.Manifest.Description,
@@ -153,4 +143,74 @@ func (p *Plugin) ToServerDescriptors() []market.ServerDescriptor {
 		})
 	}
 	return descriptors
+}
+
+// ResolveCLIOverlay resolves inline or external manifest CLI metadata exactly
+// once. External files are opened relative to the plugin root with os.Root so
+// absolute paths, parent traversal, and escaping symlinks fail closed.
+func (p *Plugin) ResolveCLIOverlay(serverKey string) (mcptypes.CLIOverlay, bool) {
+	overlay := mcptypes.CLIOverlay{
+		ID:      serverKey,
+		Command: serverKey,
+	}
+	server, ok := p.Manifest.MCPServers[serverKey]
+	if !ok || len(server.CLI) == 0 {
+		return overlay, true
+	}
+
+	data := []byte(strings.TrimSpace(string(server.CLI)))
+	if len(data) == 0 {
+		return overlay, true
+	}
+	if data[0] == '"' {
+		var relativePath string
+		if err := json.Unmarshal(data, &relativePath); err != nil ||
+			strings.TrimSpace(relativePath) == "" {
+			slog.Warn("plugin: invalid external CLI overlay path",
+				"plugin", p.Manifest.Name, "server", serverKey, "error", err)
+			return mcptypes.CLIOverlay{}, false
+		}
+		root, err := os.OpenRoot(p.Root)
+		if err != nil {
+			slog.Warn("plugin: failed to open plugin root",
+				"plugin", p.Manifest.Name, "server", serverKey, "error", err)
+			return mcptypes.CLIOverlay{}, false
+		}
+		defer root.Close()
+		file, err := root.Open(relativePath)
+		if err != nil {
+			slog.Warn("plugin: failed to open CLI overlay file",
+				"plugin", p.Manifest.Name, "server", serverKey,
+				"path", relativePath, "error", err)
+			return mcptypes.CLIOverlay{}, false
+		}
+		defer file.Close()
+		data, err = io.ReadAll(io.LimitReader(file, maxPluginCLIOverlayBytes+1))
+		if err != nil || len(data) > maxPluginCLIOverlayBytes {
+			slog.Warn("plugin: failed to read CLI overlay file",
+				"plugin", p.Manifest.Name, "server", serverKey,
+				"path", relativePath, "error", err)
+			return mcptypes.CLIOverlay{}, false
+		}
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&overlay); err != nil {
+		slog.Warn("plugin: failed to parse CLI overlay",
+			"plugin", p.Manifest.Name, "server", serverKey, "error", err)
+		return mcptypes.CLIOverlay{}, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		slog.Warn("plugin: CLI overlay contains trailing JSON",
+			"plugin", p.Manifest.Name, "server", serverKey, "error", err)
+		return mcptypes.CLIOverlay{}, false
+	}
+	if strings.TrimSpace(overlay.ID) == "" {
+		overlay.ID = serverKey
+	}
+	if strings.TrimSpace(overlay.Command) == "" {
+		overlay.Command = serverKey
+	}
+	return overlay, true
 }

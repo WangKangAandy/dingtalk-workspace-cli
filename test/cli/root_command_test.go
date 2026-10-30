@@ -13,9 +13,7 @@ import (
 // MCP architecture, products are discovered dynamically from MCP servers,
 // and their availability depends on the test environment's fixture data.
 
-func TestHiddenMCPHelpIsReachable(t *testing.T) {
-	t.Parallel()
-
+func TestPublicMCPHelpShowsReviewedURLCommand(t *testing.T) {
 	cmd := app.NewRootCommand()
 	var out strings.Builder
 	cmd.SetOut(&out)
@@ -27,14 +25,13 @@ func TestHiddenMCPHelpIsReachable(t *testing.T) {
 	}
 
 	got := out.String()
-	if !strings.Contains(got, "Reserved canonical runtime surface") {
-		t.Fatalf("mcp help missing canonical surface text:\n%s", got)
+	if !strings.Contains(got, "管理经过审核并纳入 Schema 的 MCP 服务连接辅助能力") ||
+		!strings.Contains(got, "url") {
+		t.Fatalf("mcp help missing expected text:\n%s", got)
 	}
 }
 
 func TestSkillCommandIsRegistered(t *testing.T) {
-	t.Parallel()
-
 	root := app.NewRootCommand()
 
 	var found bool
@@ -46,30 +43,5 @@ func TestSkillCommandIsRegistered(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("skill command should be registered")
-	}
-}
-
-// TestSchemaJSONBootstrapOutput was removed
-// because it depended on a fixture file (empty_catalog.json) that
-// is no longer available. The schema command behavior has changed
-// in the protocol-first MCP architecture and requires different
-// test setup.
-
-func TestCacheStatusJSONBootstrapOutput(t *testing.T) {
-	t.Parallel()
-
-	cmd := app.NewRootCommand()
-	var out strings.Builder
-	cmd.SetOut(&out)
-	cmd.SetErr(&out)
-	cmd.SetArgs([]string{"cache", "status", "--json"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	got := out.String()
-	if !strings.Contains(got, "\"kind\": \"cache_status\"") {
-		t.Fatalf("cache status output missing JSON payload:\n%s", got)
 	}
 }

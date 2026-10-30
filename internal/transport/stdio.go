@@ -25,6 +25,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 )
 
 // StdioClient manages a local MCP server subprocess, communicating via
@@ -42,7 +45,13 @@ type StdioClient struct {
 	mu      sync.Mutex // serializes JSON-RPC requests
 	nextID  int64
 	started bool
+
+	lifecycleMu sync.Mutex
+	initialized bool
+	initResult  InitializeResult
 }
+
+var stdioCommandContext = exec.CommandContext
 
 // NewStdioClient creates a StdioClient for the given command.
 // The subprocess is not started until Start() is called.
@@ -63,7 +72,7 @@ func (s *StdioClient) Start(ctx context.Context) error {
 		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, s.command, s.args...)
+	cmd := stdioCommandContext(ctx, s.command, s.args...)
 
 	// Build environment: inherit current env + merge plugin-specific vars.
 	cmd.Env = os.Environ()
@@ -108,10 +117,14 @@ func (s *StdioClient) Start(ctx context.Context) error {
 // Stop kills the subprocess and waits for it to exit.
 // A non-zero exit code after Kill is expected and not treated as an error.
 func (s *StdioClient) Stop() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if !s.started || s.cmd == nil {
+		s.initialized = false
+		s.initResult = InitializeResult{}
 		return nil
 	}
 
@@ -121,15 +134,43 @@ func (s *StdioClient) Stop() error {
 		_ = s.cmd.Process.Kill()
 		_ = s.cmd.Wait()
 		s.started = false
+		s.initialized = false
+		s.initResult = InitializeResult{}
 		return nil
 	}
 	err := s.cmd.Wait()
 	s.started = false
+	s.initialized = false
+	s.initResult = InitializeResult{}
 	return err
 }
 
 // Initialize sends the JSON-RPC initialize request.
 func (s *StdioClient) Initialize(ctx context.Context) (InitializeResult, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.initialize(ctx)
+}
+
+// EnsureInitialized lazily starts the subprocess and performs the MCP
+// initialize handshake exactly once for the current process lifecycle.
+func (s *StdioClient) EnsureInitialized(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.initialized {
+		return nil
+	}
+	if err := s.Start(context.Background()); err != nil {
+		return err
+	}
+	_, err := s.initialize(ctx)
+	return err
+}
+
+func (s *StdioClient) initialize(ctx context.Context) (InitializeResult, error) {
+	if s.initialized {
+		return s.initResult, nil
+	}
 	params := map[string]any{
 		"protocolVersion": supportedProtocolVersions[0],
 		"capabilities":    map[string]any{},
@@ -143,6 +184,8 @@ func (s *StdioClient) Initialize(ctx context.Context) (InitializeResult, error) 
 	if err := s.call(ctx, "initialize", params, &result); err != nil {
 		return InitializeResult{}, err
 	}
+	s.initialized = true
+	s.initResult = result
 	return result, nil
 }
 
@@ -201,26 +244,42 @@ func (s *StdioClient) call(ctx context.Context, method string, params any, resul
 
 	// Read response line (respects context cancellation).
 	type readResult struct {
-		line []byte
-		err  error
+		line     []byte
+		err      error
+		tooLarge bool
 	}
 	ch := make(chan readResult, 1)
 	go func() {
-		line, err := s.stdout.ReadBytes('\n')
-		ch <- readResult{line, err}
+		line, tooLarge, err := readBoundedStdioLine(s.stdout, config.MaxResponseBodySize)
+		ch <- readResult{line: line, err: err, tooLarge: tooLarge}
 	}()
 
 	select {
 	case <-ctx.Done():
+		s.invalidateProcessLocked()
 		return fmt.Errorf("stdio: %w", ctx.Err())
 	case rr := <-ch:
+		if rr.tooLarge {
+			s.invalidateProcessLocked()
+			return fmt.Errorf("stdio: response exceeds safety limit of %d bytes", config.MaxResponseBodySize)
+		}
 		if rr.err != nil {
 			return fmt.Errorf("stdio: read response: %w", rr.err)
 		}
 
+		if err := jsonutil.RejectDuplicateObjectKeys(rr.line); err != nil {
+			return fmt.Errorf("stdio: invalid response: %w", err)
+		}
+		if err := jsonutil.RejectNonCanonicalObjectKeys(rr.line, "jsonrpc", "id", "result", "error"); err != nil {
+			return fmt.Errorf("stdio: invalid response: %w", err)
+		}
 		var resp responseEnvelope
 		if err := json.Unmarshal(rr.line, &resp); err != nil {
 			return fmt.Errorf("stdio: unmarshal response: %w", err)
+		}
+		if resp.JSONRPC != "2.0" || resp.ID != int(id) {
+			s.invalidateProcessLocked()
+			return fmt.Errorf("stdio: response envelope does not match request id %d", id)
 		}
 
 		if resp.Error != nil {
@@ -231,10 +290,45 @@ func (s *StdioClient) call(ctx context.Context, method string, params any, resul
 			if err := json.Unmarshal(resp.Result, result); err != nil {
 				return fmt.Errorf("stdio: unmarshal result: %w", err)
 			}
+			if tools, ok := result.(*ToolsListResult); ok {
+				tools.RawResponseBytes = len(rr.line)
+			}
 		}
 
 		return nil
 	}
+}
+
+func readBoundedStdioLine(reader *bufio.Reader, limit int) ([]byte, bool, error) {
+	line := make([]byte, 0, min(limit, 64*1024))
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(fragment) > limit-len(line) {
+			return nil, true, nil
+		}
+		line = append(line, fragment...)
+		switch err {
+		case nil:
+			return line, false, nil
+		case bufio.ErrBufferFull:
+			continue
+		default:
+			return nil, false, err
+		}
+	}
+}
+
+func (s *StdioClient) invalidateProcessLocked() {
+	if s.stdin != nil {
+		_ = s.stdin.Close()
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+		_ = s.cmd.Wait()
+	}
+	s.started = false
+	s.initialized = false
+	s.initResult = InitializeResult{}
 }
 
 // drainStderr reads stderr in the background and logs lines at debug level.

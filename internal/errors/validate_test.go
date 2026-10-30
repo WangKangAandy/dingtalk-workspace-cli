@@ -13,7 +13,10 @@
 
 package errors
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestResourceName(t *testing.T) {
 	t.Parallel()
@@ -23,7 +26,7 @@ func TestResourceName(t *testing.T) {
 		input   string
 		wantErr bool
 	}{
-		{name: "valid", input: "search_open_platform_docs"},
+		{name: "valid", input: "search_open_platform_docs_rag"},
 		{name: "valid-cjk", input: "审批查询"},
 		{name: "leading-digit", input: "1tool", wantErr: true},
 		{name: "shell-char", input: "tool;rm", wantErr: true},
@@ -93,7 +96,7 @@ func TestSafeLocalFlagPath(t *testing.T) {
 		{name: "relative-file", flagName: "--file", value: "data.json", want: "data.json"},
 		{name: "relative-nested", flagName: "--file", value: "dir/file.txt", want: "dir/file.txt"},
 		// Invalid paths
-		{name: "absolute", flagName: "--file", value: "/etc/passwd", wantErr: true},
+		{name: "absolute", flagName: "--file", value: filepath.Join(t.TempDir(), "absolute"), wantErr: true},
 		{name: "traversal", flagName: "--file", value: "../secret", wantErr: true},
 	}
 

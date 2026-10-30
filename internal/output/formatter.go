@@ -14,14 +14,18 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -54,21 +58,162 @@ var preferredListKeys = []string{
 	"result", "documents", "emailAccounts", "todoCards", "events", "messages",
 }
 
+var (
+	marshalJSON       = json.Marshal
+	unmarshalJSON     = json.Unmarshal
+	marshalJSONOutput = jsonutil.Marshal
+	marshalJSONIndent = jsonutil.MarshalIndent
+)
+
+func unmarshalJSONUseNumber(data []byte, out *any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	*out = normalizeSafeJSONNumbers(*out)
+	return nil
+}
+
+func normalizeSafeJSONNumbers(value any) any {
+	switch typed := value.(type) {
+	case json.Number:
+		text := typed.String()
+		if strings.ContainsAny(text, ".eE") {
+			return typed
+		}
+		integer, err := strconv.ParseInt(text, 10, 64)
+		if err == nil && integer >= -(1<<53) && integer <= 1<<53 {
+			return float64(integer)
+		}
+		return typed
+	case []any:
+		for index := range typed {
+			typed[index] = normalizeSafeJSONNumbers(typed[index])
+		}
+		return typed
+	case map[string]any:
+		for key := range typed {
+			typed[key] = normalizeSafeJSONNumbers(typed[key])
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
 func ResolveFormat(cmd *cobra.Command, fallback Format) Format {
+	format, _ := resolveFormatWithWarning(cmd, fallback)
+	return format
+}
+
+// resolveFormatWithWarning 解析命令的 --format flag（B36，AC-09）：已知值
+// 归一化为对应 Format 常量；未知非空值**降级 fallback 并产出一条 warning
+// 文本**（不崩不静默，契约规范 §5.2「未知值 → 降级 + stderr warning」）。
+// warning 的写出由调用方负责（信封出口 WriteEnvelope 写 cmd.ErrOrStderr()），
+// 本函数不做 I/O——ResolveFormat 的既有调用方（只读 format 值、不持有出口
+// 语义）行为保持不变。flag 缺席或值为空返回 fallback 且不产生 warning
+// （空值是「未指定」而非「未知」）。查找顺序与 ResolveFormat 一致：
+// cmd.Flags() 优先于 InheritedFlags()，命中 format flag 即返回。
+func resolveFormatWithWarning(cmd *cobra.Command, fallback Format) (Format, string) {
+	if cmd == nil {
+		return fallback, ""
+	}
+	for _, flags := range []*pflag.FlagSet{cmd.Flags(), cmd.InheritedFlags()} {
+		value, ok := formatValueFromFlagSet(flags)
+		if !ok {
+			continue
+		}
+		format := normalizeFormat(value, fallback)
+		return format, unknownFormatWarning(value, format)
+	}
+	return fallback, ""
+}
+
+// formatValueFromFlagSet 返回 flagSet 上 --format flag 的原始字符串值
+// （B35/B36/B43 共用的查找辅助）。flag 缺席或类型非 string 时返回 ok=false——
+// 与 formatFromFlagSet 的容错口径一致（不报错、交由 fallback 兜底）。
+func formatValueFromFlagSet(flags *pflag.FlagSet) (string, bool) {
+	if flags == nil || flags.Lookup("format") == nil {
+		return "", false
+	}
+	value, err := flags.GetString("format")
+	if err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// unknownFormatWarning 在 raw 为非空未知值（归一化后不等于 resolved，即不是
+// 任何已知 format 的大小写/空白变体）时返回 warning 文本，否则返回空串
+// （B36，AC-09 不崩不静默）。文本只陈述事实（未知值 + 降级目标），
+// 不做过度承诺。
+func unknownFormatWarning(raw string, resolved Format) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" || trimmed == string(resolved) {
+		return ""
+	}
+	return fmt.Sprintf("unknown --format %q, falling back to %q", raw, string(resolved))
+}
+
+// ResolveFormatWithJSONShorthand 解析命令的输出 format，实现 --json 简写语义
+// （B43，契约规范 §5.2：「--json 自动注册为 --format json 简写（显式
+// --format 优先）」）。优先级链：
+//
+//  1. 显式 --format（非空值）恒优先——含未知值（按 normalizeFormat 降级
+//     fallback，--json 不 rescues 未知值）；
+//  2. --format 缺席或为空时，--json 布尔 flag（Changed 且为 true）等价
+//     --format json；
+//  3. 两者皆无 → fallback。
+//
+// --json 判定只接受 bool 型 flag（GetBool 成功）：业务层存在同名 string
+// flag（如 table create --json 载荷参数）的命令不会被误判为简写。本函数
+// 纯判定不做 I/O，供不直接走 WriteEnvelope 的调用方（如主漏斗桥接，B44）
+// 复用；与 resolveFormatWithWarning 共用 formatValueFromFlagSet /
+// normalizeFormat，归一化规则单一事实源。
+func ResolveFormatWithJSONShorthand(cmd *cobra.Command, fallback Format) Format {
 	if cmd == nil {
 		return fallback
 	}
 	for _, flags := range []*pflag.FlagSet{cmd.Flags(), cmd.InheritedFlags()} {
-		if format, ok := formatFromFlagSet(flags, fallback); ok {
-			return format
+		value, ok := formatValueFromFlagSet(flags)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(value) != "" {
+			return normalizeFormat(value, fallback)
 		}
 	}
-	if root := cmd.Root(); root != nil {
-		if format, ok := formatFromFlagSet(root.PersistentFlags(), fallback); ok {
-			return format
-		}
+	if jsonShorthandActive(cmd) {
+		return FormatJSON
 	}
 	return fallback
+}
+
+// jsonShorthandActive 报告 cmd 上是否有生效的 --json 简写（bool flag 被显式
+// 设置为 true）。查找 Flags / InheritedFlags / PersistentFlags 三组，与
+// internal/app 侧 commandRequestsJSONErrors 的判定面一致；GetBool 失败
+// （非 bool 同名 flag）跳过该组继续。
+func jsonShorthandActive(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	for _, flags := range []*pflag.FlagSet{cmd.Flags(), cmd.InheritedFlags(), cmd.PersistentFlags()} {
+		flag := flags.Lookup("json")
+		if flag == nil || !flag.Changed {
+			continue
+		}
+		if value, err := flags.GetBool("json"); err == nil {
+			return value
+		}
+	}
+	return false
 }
 
 func WriteCommandPayload(cmd *cobra.Command, payload any, fallback Format) error {
@@ -123,15 +268,8 @@ func unwrapCompatRuntimePayload(payload any) any {
 }
 
 func formatFromFlagSet(flags *pflag.FlagSet, fallback Format) (Format, bool) {
-	if flags == nil {
-		return fallback, false
-	}
-	flag := flags.Lookup("format")
-	if flag == nil {
-		return fallback, false
-	}
-	value, err := flags.GetString("format")
-	if err != nil {
+	value, ok := formatValueFromFlagSet(flags)
+	if !ok {
 		return fallback, false
 	}
 	return normalizeFormat(value, fallback), true
@@ -185,9 +323,6 @@ func ResolveFields(cmd *cobra.Command) string {
 		return ""
 	}
 	rootFlags := rootPersistentFlags(cmd)
-	if rootFlags == nil {
-		return ""
-	}
 	globalFlag := rootFlags.Lookup("fields")
 	if globalFlag == nil {
 		return ""
@@ -198,9 +333,6 @@ func ResolveFields(cmd *cobra.Command) string {
 		cmd.InheritedFlags(),
 		rootFlags,
 	} {
-		if flags == nil {
-			continue
-		}
 		if f := flags.Lookup("fields"); f != nil && f.Changed {
 			// To avoid collision with business flags (e.g. table create --fields),
 			// verify this flag shares the same usage string as the global one.
@@ -221,9 +353,6 @@ func ResolveJQ(cmd *cobra.Command) string {
 		return ""
 	}
 	rootFlags := rootPersistentFlags(cmd)
-	if rootFlags == nil {
-		return ""
-	}
 	globalFlag := rootFlags.Lookup("jq")
 	if globalFlag == nil {
 		return ""
@@ -234,9 +363,6 @@ func ResolveJQ(cmd *cobra.Command) string {
 		cmd.InheritedFlags(),
 		rootFlags,
 	} {
-		if flags == nil {
-			continue
-		}
 		if f := flags.Lookup("jq"); f != nil && f.Changed {
 			if f.Usage == globalFlag.Usage {
 				if v, err := flags.GetString("jq"); err == nil {
@@ -249,15 +375,15 @@ func ResolveJQ(cmd *cobra.Command) string {
 }
 
 func rootPersistentFlags(cmd *cobra.Command) *pflag.FlagSet {
-	if root := cmd.Root(); root != nil {
-		return root.PersistentFlags()
+	if cmd == nil {
+		return nil
 	}
-	return nil
+	return cmd.Root().PersistentFlags()
 }
 
 // WriteJSON marshals payload as indented JSON and writes it to w.
 func WriteJSON(w io.Writer, payload any) error {
-	data, err := json.MarshalIndent(payload, "", "  ")
+	data, err := marshalJSONIndent(payload, "", "  ")
 	if err != nil {
 		return apperrors.NewInternal("failed to encode command output as JSON")
 	}
@@ -270,7 +396,7 @@ func writeRaw(w io.Writer, payload any) error {
 		_, err := fmt.Fprintln(w, SanitizeForTerminal(text))
 		return err
 	}
-	data, err := json.Marshal(payload)
+	data, err := marshalJSONOutput(payload)
 	if err != nil {
 		return apperrors.NewInternal("failed to encode raw command output")
 	}
@@ -308,10 +434,8 @@ func writeTableish(w io.Writer, payload any) error {
 		}
 		return writeKeyValues(w, typed)
 	case []any:
-		if headers, rows, ok := rowsFromSlice(typed); ok {
-			return writeTable(w, headers, rows)
-		}
-		return writeRaw(w, normalized)
+		headers, rows := rowsFromSlice(typed)
+		return writeTable(w, headers, rows)
 	default:
 		return writeRaw(w, normalized)
 	}
@@ -324,12 +448,12 @@ func normalizePayload(payload any) (any, error) {
 	if text, ok := payload.(string); ok {
 		return text, nil
 	}
-	data, err := json.Marshal(payload)
+	data, err := marshalJSON(payload)
 	if err != nil {
 		return nil, apperrors.NewInternal("failed to normalize command output")
 	}
 	var normalized any
-	if err := json.Unmarshal(data, &normalized); err != nil {
+	if err := unmarshalJSONUseNumber(data, &normalized); err != nil {
 		return nil, apperrors.NewInternal("failed to decode normalized command output")
 	}
 	return normalized, nil
@@ -364,10 +488,7 @@ func extractRowsFromMap(payload map[string]any) ([]string, [][]string, map[strin
 	if loc == nil {
 		return nil, nil, nil, false
 	}
-	headers, rows, ok := rowsFromSlice(loc.list)
-	if !ok {
-		return nil, nil, nil, false
-	}
+	headers, rows := rowsFromSlice(loc.list)
 	meta := make(map[string]any)
 	if loc.outerKey == "" {
 		for k, v := range payload {
@@ -383,26 +504,25 @@ func extractRowsFromMap(payload map[string]any) ([]string, [][]string, map[strin
 			}
 			meta[k] = v
 		}
-		if inner, ok := payload[loc.outerKey].(map[string]any); ok {
-			for k, v := range inner {
-				if k == loc.innerKey {
-					continue
-				}
-				if _, exists := meta[k]; exists {
-					// Outer wins on key collision so users see the wrapper-level
-					// sibling rather than a clobbered inner one.
-					continue
-				}
-				meta[k] = v
+		inner := payload[loc.outerKey].(map[string]any)
+		for k, v := range inner {
+			if k == loc.innerKey {
+				continue
 			}
+			if _, exists := meta[k]; exists {
+				// Outer wins on key collision so users see the wrapper-level
+				// sibling rather than a clobbered inner one.
+				continue
+			}
+			meta[k] = v
 		}
 	}
 	return headers, rows, meta, true
 }
 
-func rowsFromSlice(items []any) ([]string, [][]string, bool) {
+func rowsFromSlice(items []any) ([]string, [][]string) {
 	if len(items) == 0 {
-		return []string{"value"}, [][]string{}, true
+		return []string{"value"}, [][]string{}
 	}
 
 	allMaps := true
@@ -428,14 +548,14 @@ func rowsFromSlice(items []any) ([]string, [][]string, bool) {
 			}
 			rows = append(rows, row)
 		}
-		return headers, rows, true
+		return headers, rows
 	}
 
 	rows := make([][]string, 0, len(items))
 	for _, item := range items {
 		rows = append(rows, []string{formatValue(item)})
 	}
-	return []string{"value"}, rows, true
+	return []string{"value"}, rows
 }
 
 func writeKeyValues(w io.Writer, payload map[string]any) error {
@@ -452,7 +572,8 @@ func writeKeyValues(w io.Writer, payload map[string]any) error {
 		maxWidth = 24
 	}
 	for _, key := range keys {
-		if _, err := fmt.Fprintf(w, "%-*s  %s\n", maxWidth, key, formatValue(payload[key])); err != nil {
+		label := tui.PadRightANSI(tui.Key(key), maxWidth+1)
+		if _, err := fmt.Fprintf(w, "%s %s\n", label, formatValue(payload[key])); err != nil {
 			return err
 		}
 	}
@@ -475,57 +596,70 @@ func writeTable(w io.Writer, headers []string, rows [][]string) error {
 		}
 	}
 	for i := range widths {
-		if widths[i] > 60 {
-			widths[i] = 60
+		if widths[i] > tui.MaxTableColumnWidth {
+			widths[i] = tui.MaxTableColumnWidth
 		}
 	}
 
-	for i, header := range headers {
-		if i > 0 {
-			if _, err := io.WriteString(w, "  "); err != nil {
-				return err
-			}
-		}
-		if _, err := fmt.Fprintf(w, "%-*s", widths[i], truncate(header, widths[i])); err != nil {
-			return err
-		}
-	}
-	if _, err := fmt.Fprintln(w); err != nil {
-		return err
-	}
-	for i, width := range widths {
-		if i > 0 {
-			if _, err := io.WriteString(w, "  "); err != nil {
-				return err
-			}
-		}
-		if _, err := io.WriteString(w, strings.Repeat("-", width)); err != nil {
-			return err
-		}
-	}
-	if _, err := fmt.Fprintln(w); err != nil {
-		return err
+	if len(widths) == 0 {
+		return nil
 	}
 
-	for _, row := range rows {
-		for i, cell := range row {
-			if i >= len(widths) {
-				continue
-			}
+	writeRow := func(values []string, render func(string) string) error {
+		if _, err := io.WriteString(w, tui.Gray("│ ")); err != nil {
+			return err
+		}
+		for i := range widths {
 			if i > 0 {
-				if _, err := io.WriteString(w, "  "); err != nil {
+				if _, err := io.WriteString(w, tui.Gray(" │ ")); err != nil {
 					return err
 				}
 			}
-			if _, err := fmt.Fprintf(w, "%-*s", widths[i], truncate(cell, widths[i])); err != nil {
+			cell := ""
+			if i < len(values) {
+				cell = values[i]
+			}
+			cell = truncate(cell, widths[i])
+			if _, err := io.WriteString(w, tui.PadRightANSI(render(cell), widths[i])); err != nil {
 				return err
 			}
 		}
-		if _, err := fmt.Fprintln(w); err != nil {
+		_, err := io.WriteString(w, tui.Gray(" │\n"))
+		return err
+	}
+	writeDivider := func(left, mid, right string, render func(string) string) error {
+		if _, err := io.WriteString(w, render(left)); err != nil {
+			return err
+		}
+		for i, width := range widths {
+			if i > 0 {
+				if _, err := io.WriteString(w, render(mid)); err != nil {
+					return err
+				}
+			}
+			if _, err := io.WriteString(w, render(strings.Repeat("─", width+2))); err != nil {
+				return err
+			}
+		}
+		_, err := io.WriteString(w, render(right+"\n"))
+		return err
+	}
+
+	if err := writeDivider("╭", "┬", "╮", tui.Blue); err != nil {
+		return err
+	}
+	if err := writeRow(headers, tui.Brand); err != nil {
+		return err
+	}
+	if err := writeDivider("├", "┼", "┤", tui.Gray); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := writeRow(row, tui.White); err != nil {
 			return err
 		}
 	}
-	return nil
+	return writeDivider("╰", "┴", "╯", tui.Blue)
 }
 
 func sortedKeys(keys map[string]struct{}) []string {
@@ -544,7 +678,7 @@ func formatValue(value any) string {
 	case string:
 		return SanitizeForTerminal(typed)
 	default:
-		data, err := json.Marshal(typed)
+		data, err := marshalJSONOutput(typed)
 		if err != nil {
 			return SanitizeForTerminal(fmt.Sprintf("%v", typed))
 		}
@@ -553,24 +687,27 @@ func formatValue(value any) string {
 }
 
 func truncate(s string, maxWidth int) string {
-	if runeWidth(s) <= maxWidth {
+	if maxWidth <= 0 || runeWidth(s) <= maxWidth {
 		return s
 	}
-	runes := []rune(s)
-	if len(runes) > maxWidth-1 {
-		return string(runes[:maxWidth-1]) + "…"
+	if maxWidth == 1 {
+		return "…"
 	}
-	return s
+
+	var b strings.Builder
+	used := 0
+	limit := maxWidth - 1
+	for _, r := range s {
+		width := runeWidth(string(r))
+		if used+width > limit {
+			break
+		}
+		b.WriteRune(r)
+		used += width
+	}
+	return b.String() + "…"
 }
 
 func runeWidth(s string) int {
-	width := 0
-	for _, r := range s {
-		if r >= 0x2E80 && r <= 0x9FFF {
-			width += 2
-			continue
-		}
-		width++
-	}
-	return width
+	return tui.PlainRuneWidth(s)
 }

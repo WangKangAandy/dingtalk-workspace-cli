@@ -1,106 +1,68 @@
-// Copyright 2026 Alibaba Group
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package executor
 
 import (
 	"context"
+	"reflect"
 	"testing"
-
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/ir"
 )
 
-func TestMergePayloadsAppliesOverridesAfterJSONInputs(t *testing.T) {
-	t.Parallel()
+func TestCrossPlatformCoverageInvocationBuildersAndEchoRunner(t *testing.T) {
+	params := map[string]any{"name": "value"}
+	compat := NewCompatibilityInvocation("old path", "doc", "read", params)
+	if compat.Kind != "compat_invocation" || compat.CanonicalPath != "doc.read" || !reflect.DeepEqual(compat.Params, params) {
+		t.Fatalf("unexpected compatibility invocation: %#v", compat)
+	}
+	if got := NewCompatibilityInvocation("old", "doc", "read", nil).Params; got == nil {
+		t.Fatal("nil compatibility params were not normalized")
+	}
+	help := NewHelperInvocation("old path", "chat", "send", params)
+	if help.Kind != "helper_invocation" || help.Stage != "helper_override" {
+		t.Fatalf("unexpected helper invocation: %#v", help)
+	}
+	if got := NewHelperInvocation("old", "chat", "send", nil).Params; got == nil {
+		t.Fatal("nil helper params were not normalized")
+	}
 
-	params, err := MergePayloads(
-		`{"title":"base","notify":false,"metadata":{"owner":"alice"}}`,
-		`{"template_id":42}`,
-		map[string]any{
-			"title":  "override",
-			"notify": true,
-			"tags":   []any{"alpha", "beta"},
-		},
-	)
+	runner := EchoRunner{}
+	result, err := runner.Run(context.Background(), compat)
+	if err != nil || result.Invocation.Tool != "read" || result.Response != nil {
+		t.Fatalf("EchoRunner normal result = %#v, %v", result, err)
+	}
+	compat.DryRun = true
+	result, err = runner.Run(context.Background(), compat)
+	if err != nil || result.Response["dry_run"] != true {
+		t.Fatalf("EchoRunner dry-run result = %#v, %v", result, err)
+	}
+}
+
+func TestCrossPlatformCoverageMergePayloadsAndToolCallRequest(t *testing.T) {
+	merged, err := MergePayloads(`{"a":1,"same":"json"}`, `{"b":2,"same":"params"}`, map[string]any{"c": 3, "same": "override"})
 	if err != nil {
 		t.Fatalf("MergePayloads() error = %v", err)
 	}
+	if merged["same"] != "override" || merged["a"] != float64(1) || merged["b"] != float64(2) || merged["c"] != 3 {
+		t.Fatalf("MergePayloads() = %#v", merged)
+	}
+	if empty, err := MergePayloads(" ", "", nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty MergePayloads() = %#v, %v", empty, err)
+	}
+	merged, err = MergePayloads(`{"same":"json"}`, `{"same":"params"}`, nil)
+	if err != nil || merged["same"] != "params" {
+		t.Fatalf("MergePayloads() precedence = %#v, %v; want --params to win", merged, err)
+	}
+	for _, input := range []string{`{`, `[]`, `null`} {
+		if _, err := MergePayloads(input, "", nil); err == nil {
+			t.Errorf("MergePayloads(%q) error = nil", input)
+		}
+	}
 
-	if params["title"] != "override" {
-		t.Fatalf("MergePayloads() title = %#v, want override", params["title"])
+	request := ToolCallRequest("read", map[string]any{"id": "1"})
+	if request["method"] != "tools/call" || request["jsonrpc"] != "2.0" {
+		t.Fatalf("ToolCallRequest() = %#v", request)
 	}
-	if params["template_id"] != float64(42) {
-		t.Fatalf("MergePayloads() template_id = %#v, want 42", params["template_id"])
-	}
-	if params["notify"] != true {
-		t.Fatalf("MergePayloads() notify = %#v, want true", params["notify"])
-	}
-	if _, ok := params["metadata"].(map[string]any); !ok {
-		t.Fatalf("MergePayloads() expected metadata object to be preserved")
-	}
-}
-
-func TestMergePayloadsRejectsNonObjectJSON(t *testing.T) {
-	t.Parallel()
-
-	if _, err := MergePayloads(`["bad"]`, "", nil); err == nil {
-		t.Fatalf("MergePayloads() expected validation error for non-object JSON")
-	}
-}
-
-func TestEchoRunnerReturnsInvocation(t *testing.T) {
-	t.Parallel()
-
-	runner := EchoRunner{}
-	result, err := runner.Run(context.Background(), NewInvocation(
-		ir.CanonicalProduct{ID: "doc"},
-		ir.ToolDescriptor{RPCName: "create_document", CanonicalPath: "doc.create_document"},
-		map[string]any{"title": "spec"},
-	))
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.Invocation.CanonicalPath != "doc.create_document" {
-		t.Fatalf("Run() canonical path = %q, want doc.create_document", result.Invocation.CanonicalPath)
-	}
-}
-
-func TestEchoRunnerDryRunReturnsToolCallRequestPreview(t *testing.T) {
-	t.Parallel()
-
-	runner := EchoRunner{}
-	invocation := NewInvocation(
-		ir.CanonicalProduct{ID: "doc"},
-		ir.ToolDescriptor{RPCName: "create_document", CanonicalPath: "doc.create_document"},
-		map[string]any{"title": "spec"},
-	)
-	invocation.DryRun = true
-
-	result, err := runner.Run(context.Background(), invocation)
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.Response == nil {
-		t.Fatal("response = nil, want dry-run preview payload")
-	}
-	if result.Response["dry_run"] != true {
-		t.Fatalf("response.dry_run = %#v, want true", result.Response["dry_run"])
-	}
-	request, ok := result.Response["request"].(map[string]any)
-	if !ok {
-		t.Fatalf("response.request = %#v, want object", result.Response["request"])
-	}
-	if request["method"] != "tools/call" {
-		t.Fatalf("response.request.method = %#v, want tools/call", request["method"])
+	request = ToolCallRequest("read", nil)
+	params := request["params"].(map[string]any)
+	if params["arguments"] == nil {
+		t.Fatal("ToolCallRequest() left nil arguments")
 	}
 }

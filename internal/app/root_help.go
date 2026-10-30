@@ -2,13 +2,25 @@ package app
 
 import (
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/i18n"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/shortcut"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/tui"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
+
+// feedbackFormURL points at the DingTalk Notable form collecting dws CLI
+// user-experience feedback. The source parameter tags submissions that
+// originated from the CLI help output so they can be told apart from
+// responses arriving through other channels.
+const feedbackFormURL = "https://alidocs.dingtalk.com/notable/share/form/v01eLbnj1bw1ELb0laN_dv19yqvsgs3oebp3pcjys_1qX0QQ0?source=dws-cli"
 
 func configureRootHelp(root *cobra.Command) {
 	if root == nil {
@@ -38,62 +50,293 @@ func configureRootHelp(root *cobra.Command) {
 	defaultHelpFunc := root.HelpFunc()
 	root.SetHelpFunc(func(cmd *cobra.Command, args []string) {
 		if cmd != root {
+			if isChatProductRoot(cmd, root) {
+				renderChatShortcutFirstHelp(cmd)
+				cli.RenderHelpAffordances(cmd)
+				return
+			}
 			defaultHelpFunc(cmd, args)
+			renderPreferredShortcutAffordance(cmd)
+			cli.RenderHelpAffordances(cmd)
 			return
 		}
 		renderRootHelp(root)
 	})
 }
 
+func isChatProductRoot(cmd, root *cobra.Command) bool {
+	return cmd != nil && root != nil && cmd.Parent() == root && cmd.Name() == "chat"
+}
+
+func renderChatShortcutFirstHelp(cmd *cobra.Command) {
+	w := cmd.OutOrStdout()
+	if long := strings.TrimSpace(cmd.Long); long != "" {
+		_, _ = fmt.Fprintln(w, long)
+		_, _ = fmt.Fprintln(w)
+	}
+	_, _ = fmt.Fprintln(w, "选择顺序：")
+	_, _ = fmt.Fprintln(w, "  1. 优先使用 +shortcut 完成用户任务。")
+	_, _ = fmt.Fprintln(w, "  2. 本页只展示高频 Featured Shortcuts；其他正式 Shortcut 仍可通过 Catalog 和精确 Help 发现。")
+	_, _ = fmt.Fprintln(w, "  3. 只有 Shortcut 不支持所需底层参数或原始响应时，才使用 Atomic API Resources。")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Usage:")
+	_, _ = fmt.Fprintf(w, "  %s [flags]\n", cmd.CommandPath())
+	_, _ = fmt.Fprintf(w, "  %s [command]\n", cmd.CommandPath())
+	if len(cmd.Aliases) > 0 {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Aliases:")
+		_, _ = fmt.Fprintf(w, "  %s, %s\n", cmd.Name(), strings.Join(cmd.Aliases, ", "))
+	}
+
+	featured, catalog, atomic := chatHelpCommands(cmd)
+	renderChatHelpCommandSection(w, "Featured Shortcuts:", featured)
+	renderChatHelpCommandSection(w, "Atomic API Resources:", atomic)
+
+	_, _ = fmt.Fprintln(w, "More Chat Shortcuts:")
+	_, _ = fmt.Fprintf(w, "  当前有 %d 个 canonical Shortcut；本页展示 %d 个高频入口，另有 %d 个低频正式入口。\n",
+		len(featured)+len(catalog), len(featured), len(catalog))
+	_, _ = fmt.Fprintln(w, "  完整列表：dws shortcut list --service chat --format json")
+	_, _ = fmt.Fprintln(w, "  精确帮助：dws chat +<command> --help")
+	_, _ = fmt.Fprintln(w, "  机器契约：dws schema --cli-path \"chat +<command>\" --compact -f json")
+
+	renderCommandFlagSections(w, cmd)
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintf(w, "Use \"%s [command] --help\" for exact command help.\n", cmd.CommandPath())
+}
+
+func chatHelpCommands(cmd *cobra.Command) (featured, catalog, atomic []*cobra.Command) {
+	for _, child := range cmd.Commands() {
+		if child == nil || child.Hidden || child.Deprecated != "" || child.Name() == "help" {
+			continue
+		}
+		if !strings.HasPrefix(child.Name(), "+") {
+			if child.Annotations != nil && child.Annotations[preferredShortcutCLIPathAnnotation] != "" {
+				continue
+			}
+			atomic = append(atomic, child)
+			continue
+		}
+		tier := ""
+		if child.Annotations != nil {
+			tier = child.Annotations[shortcut.HelpTierAnnotation]
+		}
+		switch shortcut.HelpTier(tier) {
+		case shortcut.HelpTierCatalog:
+			catalog = append(catalog, child)
+		case shortcut.HelpTierCompatibility, shortcut.HelpTierUnavailable:
+			continue
+		default:
+			// User-defined Shortcuts and pre-tier declarations remain visible so
+			// the product Help never silently drops an explicitly installed entry.
+			featured = append(featured, child)
+		}
+	}
+	for _, commands := range [][]*cobra.Command{featured, catalog, atomic} {
+		sort.Slice(commands, func(i, j int) bool { return commands[i].Name() < commands[j].Name() })
+	}
+	return featured, catalog, atomic
+}
+
+func renderPreferredShortcutAffordance(cmd *cobra.Command) {
+	if cmd == nil || cmd.Annotations == nil {
+		return
+	}
+	owner := strings.TrimSpace(cmd.Annotations[preferredShortcutCLIPathAnnotation])
+	if owner == "" {
+		return
+	}
+	w := cmd.OutOrStdout()
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Preferred Shortcut:")
+	_, _ = fmt.Fprintf(w, "  dws %s\n", owner)
+	_, _ = fmt.Fprintln(w, "  默认使用 Shortcut；只有需要 Shortcut 未公开的底层参数或原始响应时才直接调用本 atomic 命令。")
+}
+
+func renderChatHelpCommandSection(w io.Writer, title string, commands []*cobra.Command) {
+	if len(commands) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, title)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, command := range commands {
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\n", command.Name(), strings.TrimSpace(command.Short))
+	}
+	_ = tw.Flush()
+}
+
+func renderCommandFlagSections(w io.Writer, cmd *cobra.Command) {
+	cmd.InitDefaultHelpFlag()
+	if flags := strings.TrimRight(cmd.LocalNonPersistentFlags().FlagUsages(), "\n"); strings.TrimSpace(flags) != "" {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Flags:")
+		_, _ = fmt.Fprintln(w, flags)
+	}
+	if flags := strings.TrimRight(cmd.InheritedFlags().FlagUsages(), "\n"); strings.TrimSpace(flags) != "" {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Global Flags:")
+		_, _ = fmt.Fprintln(w, flags)
+	}
+}
+
 func renderRootHelp(root *cobra.Command) {
+	w := root.OutOrStdout()
 	services := visibleMCPRootCommands(root)
 	utilities := visibleUtilityRootCommands(root)
-	w := root.OutOrStdout()
 
+	_, _ = fmt.Fprintln(w, tui.Header("Workspace CLI", "DingTalk blue-white technical console"))
+	_, _ = fmt.Fprintln(w, tui.Rule(76))
+	_, _ = fmt.Fprintln(w)
 	if len(services) == 0 {
-		_, _ = fmt.Fprintln(w, "No MCP services discovered.")
-		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintf(w, "%s %s\n\n", tui.StateMark("warning"), tui.Warning("No MCP services discovered."))
 	} else {
-		_, _ = fmt.Fprintln(w, "Discovered MCP Services:")
+		_, _ = fmt.Fprintln(w, tui.Section("Discovered MCP Services:"))
 		_, _ = fmt.Fprintln(w)
-
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		for _, service := range services {
-			_, _ = fmt.Fprintf(tw, "  %s\t%s\n", service.Name(), strings.TrimSpace(service.Short))
+			_, _ = fmt.Fprintf(tw, "  %s %s\t%s\n", tui.StateMark("ok"), tui.Bold(service.Name()), tui.Dim(strings.TrimSpace(service.Short)))
 		}
 		_ = tw.Flush()
 		_, _ = fmt.Fprintln(w)
 	}
 
-	_, _ = fmt.Fprintln(w, "Usage:")
-	_, _ = fmt.Fprintln(w, "  dws <service> [command] [flags]")
+	_, _ = fmt.Fprintln(w, tui.Section("Usage:"))
+	_, _ = fmt.Fprintf(w, "  %s %s\n", tui.Bullet(), tui.White("dws <service> [command] [flags]"))
 	if len(utilities) > 0 {
-		_, _ = fmt.Fprintln(w, "  dws <command> [flags]")
+		_, _ = fmt.Fprintf(w, "  %s %s\n", tui.Bullet(), tui.White("dws <command> [flags]"))
 	}
 	_, _ = fmt.Fprintln(w)
 	if len(utilities) > 0 {
-		_, _ = fmt.Fprintln(w, "Utility Commands:")
+		_, _ = fmt.Fprintln(w, tui.Section("Utility Commands:"))
 		_, _ = fmt.Fprintln(w)
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		for _, utility := range utilities {
-			_, _ = fmt.Fprintf(tw, "  %s\t%s\n", utility.Name(), strings.TrimSpace(utility.Short))
+			_, _ = fmt.Fprintf(tw, "  %s %s\t%s\n", tui.Bullet(), tui.Bold(utility.Name()), tui.Dim(commandShort(utility)))
 		}
 		_ = tw.Flush()
 		_, _ = fmt.Fprintln(w)
 	}
-	_, _ = fmt.Fprintln(w, `Use "dws <service> --help" for more information about a discovered MCP service or "dws <command> --help" for utility commands.`)
+	renderRootGlobalFlags(root)
+	renderRootAgentQuickstart(w)
+	renderRootSafetyModel(w)
+	_, _ = fmt.Fprintf(w, "%s %s\n", tui.Key("Next"), `Use "dws <service> --help" for more information about a discovered MCP service or "dws <command> --help" for utility commands.`)
+	if long := strings.TrimSpace(root.Long); long != "" {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, tui.Dim(long))
+	}
+	_, _ = fmt.Fprintln(w)
+	renderRootFeedback(w)
+}
+
+func renderRootGlobalFlags(root *cobra.Command) {
+	if root == nil {
+		return
+	}
+	flags := visiblePersistentFlags(root)
+	if len(flags) == 0 {
+		return
+	}
+	w := root.OutOrStdout()
+	_, _ = fmt.Fprintln(w, tui.Section("Global Flags:"))
+	_, _ = fmt.Fprintln(w)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, flag := range flags {
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\n", formatRootFlag(flag), tui.Dim(strings.TrimSpace(flag.Usage)))
+	}
+	_ = tw.Flush()
+	_, _ = fmt.Fprintln(w)
+}
+
+func renderRootAgentQuickstart(w io.Writer) {
+	_, _ = fmt.Fprintln(w, tui.Section("Agent Quickstart:"))
+	_, _ = fmt.Fprintln(w, "  1. Browse a product: dws <service> --help")
+	_, _ = fmt.Fprintln(w, "  2. Inspect leaf parameters and semantics: dws <path> --help")
+	_, _ = fmt.Fprintln(w, `  3. Read the machine contract: dws schema --cli-path "<path>" --compact -f json`)
+	_, _ = fmt.Fprintln(w, "  4. Prefer structured output. Use dry-run only when the leaf explicitly supports it.")
+	_, _ = fmt.Fprintln(w, "  5. Never add --yes without explicit user confirmation.")
+	_, _ = fmt.Fprintln(w)
+}
+
+func renderRootSafetyModel(w io.Writer) {
+	_, _ = fmt.Fprintln(w, tui.Section("Safety model:"))
+	_, _ = fmt.Fprintln(w, "  effect=read|write|destructive — whether the command reads, changes, or irreversibly removes state")
+	_, _ = fmt.Fprintln(w, "  risk=low|medium|high — expected impact if the command is used incorrectly")
+	_, _ = fmt.Fprintln(w, "  confirmation=not_required|user_required — whether explicit user approval is required")
+	_, _ = fmt.Fprintln(w, "  idempotency=idempotent|retryable|non_idempotent|unknown — whether repeating the command is safe")
+	_, _ = fmt.Fprintln(w)
+}
+
+func renderRootFeedback(w io.Writer) {
+	_, _ = fmt.Fprintln(w, tui.Section("Feedback:"))
+	_, _ = fmt.Fprintf(w, "  %s %s\n", tui.Bullet(), tui.Dim("使用体验反馈问卷（1 分钟）"))
+	_, _ = fmt.Fprintf(w, "    %s\n", tui.Cyan(feedbackFormURL))
+}
+
+func visiblePersistentFlags(root *cobra.Command) []*pflag.Flag {
+	if root == nil {
+		return nil
+	}
+	flags := make([]*pflag.Flag, 0)
+	root.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		if flag == nil || flag.Hidden {
+			return
+		}
+		flags = append(flags, flag)
+	})
+	return flags
+}
+
+func formatRootFlag(flag *pflag.Flag) string {
+	if flag == nil {
+		return ""
+	}
+	name := "--" + flag.Name
+	if flag.Value != nil && flag.Value.Type() != "bool" {
+		name += " " + flag.Value.Type()
+	}
+	if flag.Shorthand == "" {
+		return "    " + name
+	}
+	return "-" + flag.Shorthand + ", " + name
+}
+
+func commandShort(cmd *cobra.Command) string {
+	if cmd == nil {
+		return ""
+	}
+	short := strings.TrimSpace(cmd.Short)
+	if cmd.Name() == "help" && short == "Help about any command" {
+		return i18n.T("查看任意命令的帮助信息")
+	}
+	return short
 }
 
 // resolveVisibleProducts returns the set of top-level product IDs that should
 // be treated as visible. It unions the edition's VisibleProducts hook (when
-// set) with DirectRuntimeProductIDs(), so dynamically-registered products —
-// including plugins loaded via AppendDynamicServer — are never silently hidden
-// by a static VisibleProducts list.
+// set), StaticServers product IDs, and DirectRuntimeProductIDs(), so
+// dynamically-registered products — including plugins loaded via
+// AppendDynamicServer — are never silently hidden by a static VisibleProducts
+// list.
+//
+// Edition endpoints are consulted directly (without injectStaticServers) so
+// declaration-only roots retain the same visibility as a fresh runtime root.
+// Supplement endpoints may back explicitly registered public helper commands;
+// this set only filters existing Cobra nodes and never creates product commands.
 func resolveVisibleProducts() map[string]bool {
 	allowed := map[string]bool{}
 	if fn := edition.Get().VisibleProducts; fn != nil {
 		for _, p := range fn() {
 			allowed[p] = true
+		}
+	}
+	for _, servers := range []func() []edition.ServerInfo{edition.Get().StaticServers, edition.Get().SupplementServers} {
+		if servers == nil {
+			continue
+		}
+		for _, server := range servers() {
+			if id := strings.TrimSpace(server.ID); id != "" {
+				allowed[id] = true
+			}
 		}
 	}
 	for id := range DirectRuntimeProductIDs() {
@@ -108,9 +351,6 @@ func visibleMCPRootCommands(root *cobra.Command) []*cobra.Command {
 	}
 
 	allowed := resolveVisibleProducts()
-	if len(allowed) == 0 {
-		return nil
-	}
 
 	commands := make([]*cobra.Command, 0)
 	for _, cmd := range root.Commands() {

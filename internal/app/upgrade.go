@@ -7,26 +7,81 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/tui"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/upgrade"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
 
 var (
-	ugBold    = color.New(color.Bold).SprintFunc()
-	ugGreen   = color.New(color.FgGreen).SprintFunc()
-	ugYellow  = color.New(color.FgYellow).SprintFunc()
-	ugRed     = color.New(color.FgRed).SprintFunc()
-	ugCyan    = color.New(color.FgCyan).SprintFunc()
-	ugDim     = color.New(color.Faint).SprintFunc()
-	ugBoldGrn = color.New(color.Bold, color.FgGreen).SprintFunc()
+	ugBold    = tui.Bold
+	ugGreen   = tui.Success
+	ugYellow  = tui.Warning
+	ugRed     = tui.Danger
+	ugCyan    = tui.Cyan
+	ugDim     = tui.Dim
+	ugBoldGrn = tui.Success
+)
+
+type upgradeReleaseClient interface {
+	FetchLatestReleaseForTrack(upgrade.ReleaseTrack) (*upgrade.ReleaseInfo, error)
+	FetchReleaseByTag(string) (*upgrade.ReleaseInfo, error)
+	FetchReleaseVersions(upgrade.ReleaseTrack) ([]upgrade.VersionEntry, error)
+}
+
+type upgradeRollbackManager interface {
+	ListBackups() ([]upgrade.BackupInfo, error)
+	RollbackTo(upgrade.BackupInfo) error
+	Backup(string) (string, error)
+	Cleanup(int) error
+}
+
+var (
+	newUpgradeReleaseClient           = func() upgradeReleaseClient { return upgrade.NewClient() }
+	newUpgradeRollback                = func() upgradeRollbackManager { return upgrade.NewRollbackManager() }
+	prepareUpgradeNPMPackage          = upgrade.PrepareNPMPackage
+	resolveUpgradePlatformRelease     = upgrade.ResolvePlatformRelease
+	downloadUpgradePlatformAsset      = upgrade.DownloadPlatformAsset
+	ensureUpgradeDirs                 = upgrade.EnsureUpgradeDirectories
+	cleanupUpgradeStale               = upgrade.CleanupStaleFiles
+	upgradeNeedsUpgrade               = upgrade.NeedsUpgrade
+	findUpgradeBinary                 = upgrade.FindBinaryAsset
+	findUpgradeSkills                 = upgrade.FindSkillsAsset
+	findUpgradeChecksums              = upgrade.FindChecksumsAsset
+	downloadUpgradeFile               = upgrade.Download
+	downloadUpgradeProgress           = upgrade.DownloadWithProgress
+	extractUpgradeZip                 = upgrade.ExtractZip
+	findExtractedBinary               = upgrade.FindBinaryInDir
+	locateUpgradeSkill                = upgrade.LocateSkillsRoot
+	replaceUpgradeSelf                = upgrade.ReplaceSelf
+	installUpgradeSkills              = upgrade.UpgradeSkillLocationsWithOptions
+	invalidateSchemaCacheAfterUpgrade = cli.InvalidatePersistedSchemaCacheIdentities
+	upgradeMkdirTemp                  = os.MkdirTemp
+	upgradeRemoveAll                  = os.RemoveAll
+	upgradeReadFile                   = os.ReadFile
+	upgradeMkdirAll                   = os.MkdirAll
+	verifyUpgradeFile                 = strictVerifyFile
+	extractUpgradeTarGz               = extractTarGz
+	validateUpgradeBinary             = validateNewBinary
+	upgradeStat                       = os.Stat
+	upgradeChmod                      = os.Chmod
+	upgradeTryExecVersion             = tryExecVersion
+	upgradeRepairDarwin               = repairDarwinBinary
+	upgradeRuntimeGOOS                = runtime.GOOS
+	upgradeLookPath                   = exec.LookPath
+	upgradeCommandOutput              = func(name string, args ...string) ([]byte, error) {
+		return exec.Command(name, args...).CombinedOutput()
+	}
+	upgradeUserHomeDir = os.UserHomeDir
 )
 
 const defaultListLimit = 10
@@ -40,6 +95,7 @@ func newUpgradeCommand() *cobra.Command {
 		flagForce      bool
 		flagSkipSkills bool
 		flagAll        bool
+		flagBeta       bool
 	)
 
 	cmd := &cobra.Command{
@@ -47,14 +103,21 @@ func newUpgradeCommand() *cobra.Command {
 		Short: "升级 DWS CLI 到最新版本",
 		Long: `检查并升级 DWS CLI 到最新版本。
 
-自动下载匹配当前平台的二进制文件和技能包，通过 SHA256 校验后原子替换。
-升级前会自动备份当前版本，可通过 --rollback 回滚。`,
+独立二进制安装会下载匹配当前平台的二进制和技能包，校验后原子替换。
+独立安装升级前会自动备份，可通过 --rollback 回滚。
+npm/pnpm/Homebrew 安装交由原包管理器升级；不支持 --skip-skills 或 --rollback。
+Windows 包管理器安装会给出手动升级命令，请退出当前进程后执行。
+独立安装每次升级都会按新版本官方清单全量覆盖预制 Skill；--force 仅额外允许重装当前版本。`,
 		Example: `  dws upgrade                    # 交互式升级到最新版本
   dws upgrade --check            # 仅检查是否有新版本
   dws upgrade --list             # 列出最近版本
-  dws upgrade --list --all       # 列出所有版本
-  dws upgrade --version v1.0.5   # 升级到指定版本
+  dws upgrade --list --all       # 列出所选轨道的全部版本
+  dws upgrade --beta             # 升级到最新 beta 预发布版本
+  dws upgrade --version v1.0.7   # 升级到指定正式版本
+  dws upgrade --version v1.0.8-beta.1  # 升级到指定 beta 版本
+  dws upgrade --force           # 即使已是最新版本也重装当前版本
   dws upgrade --rollback         # 回滚到上一版本
+  dws upgrade --dry-run          # 仅预览升级步骤，不实际执行
   dws upgrade -y                 # 跳过确认直接升级`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,36 +130,44 @@ func newUpgradeCommand() *cobra.Command {
 			}
 
 			yes, _ := cmd.Flags().GetBool("yes")
+			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			format := resolveUpgradeFormat(cmd)
+			track := upgradeTrack(flagBeta)
+			if flagBeta && flagVersion != "" {
+				return fmt.Errorf("--beta 与 --version 不能同时使用；安装指定 beta 版本请直接使用 --version vX.Y.Z-beta.N")
+			}
 
 			if flagList {
 				limit := defaultListLimit
 				if flagAll {
 					limit = 0
 				}
-				return runUpgradeList(cmd, format, limit)
+				return runUpgradeList(cmd, format, limit, track)
 			}
 			if flagRollback {
-				return runUpgradeRollback(yes)
+				return runUpgradeRollbackPreview(yes, dryRun)
 			}
 			if flagCheck {
-				return runUpgradeCheck(cmd, format)
+				return runUpgradeCheck(cmd, format, track)
 			}
 			return runUpgrade(cmd.Context(), upgradeOptions{
 				targetVersion: flagVersion,
 				force:         flagForce,
 				skipSkills:    flagSkipSkills,
 				yes:           yes,
+				dryRun:        dryRun,
+				track:         track,
 			})
 		},
 	}
 
 	cmd.Flags().BoolVar(&flagCheck, "check", false, "仅检查是否有新版本")
-	cmd.Flags().BoolVar(&flagList, "list", false, "列出可用版本")
-	cmd.Flags().BoolVar(&flagAll, "all", false, "与 --list 搭配，显示所有版本")
+	cmd.Flags().BoolVar(&flagList, "list", false, "列出正式 release 版本（配合 --beta 查看 beta）")
+	cmd.Flags().BoolVar(&flagAll, "all", false, "与 --list 搭配，显示所选轨道的全部版本")
 	cmd.Flags().StringVar(&flagVersion, "version", "", "升级到指定版本")
+	cmd.Flags().BoolVar(&flagBeta, "beta", false, "使用最新 beta 预发布版本（默认使用正式 release）")
 	cmd.Flags().BoolVar(&flagRollback, "rollback", false, "回滚到上一版本")
-	cmd.Flags().BoolVar(&flagForce, "force", false, "强制重新安装当前版本")
+	cmd.Flags().BoolVar(&flagForce, "force", false, "即使已是最新版本也强制重新安装当前版本")
 	cmd.Flags().BoolVar(&flagSkipSkills, "skip-skills", false, "跳过技能包更新")
 
 	return cmd
@@ -107,30 +178,33 @@ type upgradeOptions struct {
 	force         bool
 	skipSkills    bool
 	yes           bool
+	dryRun        bool
+	track         upgrade.ReleaseTrack
 }
 
 // --- dws upgrade --check ---
 
-func runUpgradeCheck(cmd *cobra.Command, format string) error {
-	client := upgrade.NewClient()
+func runUpgradeCheck(cmd *cobra.Command, format string, track upgrade.ReleaseTrack) error {
+	client := newUpgradeReleaseClient()
 
 	if format != "json" {
-		fmt.Printf("  %s\n", ugDim("检查更新..."))
+		fmt.Printf("  %s\n", ugDim(fmt.Sprintf("检查更新%s...", upgradeTrackSuffix(track))))
 	}
 
-	latest, err := client.FetchLatestRelease()
+	latest, err := client.FetchLatestReleaseForTrack(track)
 	if err != nil {
 		return fmt.Errorf("检查更新失败: %w", err)
 	}
 
 	currentVer := version
-	needsUpgrade := upgrade.NeedsUpgrade(currentVer, latest.Version)
+	needsUpgrade := upgradeNeedsUpgrade(currentVer, latest.Version)
 
 	if format == "json" {
 		return writeJSON(cmd.OutOrStdout(), map[string]any{
 			"current_version": ensureV(currentVer),
 			"latest_version":  "v" + latest.Version,
 			"needs_upgrade":   needsUpgrade,
+			"track":           string(track),
 			"release_date":    latest.Date,
 			"prerelease":      latest.Prerelease,
 			"changelog":       parseChangelogEntries(latest.Changelog, 10),
@@ -149,7 +223,7 @@ func runUpgradeCheck(cmd *cobra.Command, format string) error {
 		fmt.Printf("  %s  %s\n", ugBold("发布日期:  "), latest.Date)
 	}
 	if latest.Prerelease {
-		fmt.Printf("  %s  %s\n", ugBold("通道:      "), ugYellow("pre-release"))
+		fmt.Printf("  %s  %s\n", ugBold("轨道:      "), ugYellow("beta / pre-release"))
 	}
 	if entries := parseChangelogEntries(latest.Changelog, 5); len(entries) > 0 {
 		fmt.Printf("  %s\n", ugBold("更新内容:"))
@@ -158,7 +232,7 @@ func runUpgradeCheck(cmd *cobra.Command, format string) error {
 		}
 	}
 	fmt.Println()
-	fmt.Printf("  %s\n", ugDim("运行 dws upgrade 进行升级"))
+	fmt.Printf("  %s\n", ugDim(upgradeHintForTrack(track)))
 	return nil
 }
 
@@ -166,14 +240,14 @@ func runUpgradeCheck(cmd *cobra.Command, format string) error {
 
 // runUpgradeList displays available versions. When limit > 0, only the most
 // recent `limit` versions are shown; pass 0 to show all (--all flag).
-func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
-	client := upgrade.NewClient()
+func runUpgradeList(cmd *cobra.Command, format string, limit int, track upgrade.ReleaseTrack) error {
+	client := newUpgradeReleaseClient()
 
 	if format != "json" {
-		fmt.Printf("  %s\n", ugDim("获取版本列表..."))
+		fmt.Printf("  %s\n", ugDim(fmt.Sprintf("获取版本列表%s...", upgradeTrackSuffix(track))))
 	}
 
-	versions, err := client.FetchAllReleases()
+	versions, err := client.FetchReleaseVersions(track)
 	if err != nil {
 		return fmt.Errorf("获取版本列表失败: %w", err)
 	}
@@ -188,7 +262,7 @@ func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
 	currentVer := strings.TrimPrefix(version, "v")
 
 	if format == "json" {
-		var items []map[string]any
+		items := make([]map[string]any, 0, len(versions))
 		for _, v := range versions {
 			items = append(items, map[string]any{
 				"version":    "v" + v.Version,
@@ -201,6 +275,7 @@ func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
 		result := map[string]any{
 			"current_version": ensureV(version),
 			"versions":        items,
+			"track":           string(track),
 			"total":           totalCount,
 		}
 		if truncated {
@@ -211,7 +286,7 @@ func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
 	}
 
 	if totalCount == 0 {
-		fmt.Printf("  %s\n", ugYellow("未找到任何版本"))
+		fmt.Printf("  %s\n", ugYellow(fmt.Sprintf("未找到任何%s", upgradeTrackVersionName(track))))
 		return nil
 	}
 
@@ -222,7 +297,7 @@ func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
 	for _, v := range versions {
 		releaseType := ugGreen("stable")
 		if v.Prerelease {
-			releaseType = ugYellow("pre-release")
+			releaseType = ugYellow("beta")
 		}
 		versionStr := fmt.Sprintf("v%-11s", v.Version)
 		marker := ""
@@ -239,14 +314,25 @@ func runUpgradeList(cmd *cobra.Command, format string, limit int) error {
 	if truncated {
 		fmt.Printf("  %s\n", ugDim(fmt.Sprintf("显示最近 %d 个版本（共 %d 个），使用 --list --all 查看全部", limit, totalCount)))
 	}
-	fmt.Printf("  %s\n", ugDim("提示: 使用 dws upgrade --version v1.0.7 安装指定版本"))
+	fmt.Printf("  %s\n", ugDim("提示: 使用 dws upgrade --beta 安装最新 beta；使用 --version v1.0.7 安装指定版本"))
 	return nil
 }
 
 // --- dws upgrade --rollback ---
 
 func runUpgradeRollback(yes bool) error {
-	rm := upgrade.NewRollbackManager()
+	return runUpgradeRollbackPreview(yes, false)
+}
+
+func runUpgradeRollbackPreview(yes, dryRun bool) error {
+	install, err := detectUpgradeInstallation()
+	if err != nil {
+		return err
+	}
+	if install.manager != "" {
+		return fmt.Errorf("%s 安装不支持 dws upgrade --rollback；请通过原包管理器选择历史版本", install.manager)
+	}
+	rm := newUpgradeRollback()
 
 	backups, err := rm.ListBackups()
 	if err != nil {
@@ -264,6 +350,10 @@ func runUpgradeRollback(yes bool) error {
 	fmt.Printf("  当前版本:  %s\n", ugBold(currentVer))
 	fmt.Printf("  回滚目标:  %s  %s\n", ugCyan(targetVer), ugDim("("+target.CreatedAt.Format("2006-01-02 15:04")+")"))
 
+	if dryRun {
+		fmt.Println("  [dry-run] 仅预览回滚，不修改任何文件")
+		return nil
+	}
 	if !yes {
 		fmt.Println()
 		fmt.Printf("是否回滚到 %s? [y/N] ", ugBold(targetVer))
@@ -297,34 +387,54 @@ func runUpgradeRollback(yes bool) error {
 //   Phase 2 (Apply):   replace binary + install skills — only runs if Phase 1 fully succeeds.
 // If anything fails in Phase 1, no files on disk are modified.
 
-func runUpgrade(ctx context.Context, opts upgradeOptions) error {
-	fmt.Printf("  %s\n", ugDim("检查更新..."))
-
-	if err := upgrade.EnsureUpgradeDirectories(); err != nil {
-		return fmt.Errorf("初始化目录结构失败: %w", err)
+// writeDryRunPlan renders the steps that `dws upgrade` would perform, without
+// touching the filesystem. Kept side-effect-free and writer-injectable so the
+// --dry-run contract can be asserted in tests.
+func writeDryRunPlan(w io.Writer, currentVer, binaryAssetName string, hasSkills bool) {
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %s 预览模式，不会下载或修改任何文件\n", ugBold("[dry-run]"))
+	fmt.Fprintf(w, "  将执行以下操作:\n")
+	fmt.Fprintf(w, "    [1/5] 备份当前版本 %s\n", ugDim(ensureV(currentVer)))
+	fmt.Fprintf(w, "    [2/5] 下载 %s\n", ugCyan(binaryAssetName))
+	if hasSkills {
+		fmt.Fprintf(w, "          下载 %s\n", ugCyan("dws-skills.zip"))
 	}
+	fmt.Fprintf(w, "    [3/5] 校验 SHA256\n")
+	fmt.Fprintf(w, "    [4/5] 解压并验证\n")
+	replaceStep := "替换二进制"
+	if hasSkills {
+		replaceStep += " 并安装技能包"
+	}
+	fmt.Fprintf(w, "    [5/5] %s\n", replaceStep)
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %s\n", ugDim("移除 --dry-run 以实际执行升级"))
+}
 
-	upgrade.CleanupStaleFiles()
+func runUpgrade(ctx context.Context, opts upgradeOptions) error {
+	fmt.Printf("  %s\n", ugDim(fmt.Sprintf("检查更新%s...", upgradeTrackSuffix(opts.track))))
 
-	client := upgrade.NewClient()
+	install, err := detectUpgradeInstallation()
+	if err != nil {
+		return err
+	}
+	client := newUpgradeReleaseClient()
 	var release *upgrade.ReleaseInfo
-	var err error
 
 	if opts.targetVersion != "" {
-		fmt.Printf("  指定版本: %s\n", ugCyan("v"+opts.targetVersion))
+		fmt.Printf("  指定版本: %s\n", ugCyan(ensureV(opts.targetVersion)))
 		release, err = client.FetchReleaseByTag(opts.targetVersion)
 		if err != nil {
 			return fmt.Errorf("获取版本 %s 信息失败: %w", opts.targetVersion, err)
 		}
 	} else {
-		release, err = client.FetchLatestRelease()
+		release, err = client.FetchLatestReleaseForTrack(opts.track)
 		if err != nil {
 			return fmt.Errorf("检查更新失败: %w", err)
 		}
 	}
 
 	currentVer := version
-	if !opts.force && !upgrade.NeedsUpgrade(currentVer, release.Version) {
+	if !opts.force && !upgradeNeedsUpgrade(currentVer, release.Version) {
 		fmt.Printf("\n  %s 已是最新版本 %s\n", ugBoldGrn("✔"), ugBold(ensureV(currentVer)))
 		return nil
 	}
@@ -335,7 +445,38 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 		fmt.Printf("  %s  %s\n", ugBold("发布日期:  "), release.Date)
 	}
 	if release.Prerelease {
-		fmt.Printf("  %s  %s\n", ugBold("通道:      "), ugYellow("pre-release"))
+		fmt.Printf("  %s  %s\n", ugBold("轨道:      "), ugYellow("beta / pre-release"))
+	}
+
+	if install.manager != "" {
+		return runManagedUpgrade(ctx, install, release, opts)
+	}
+
+	platformRelease, err := resolveUpgradePlatformRelease(ctx, release, opts.skipSkills)
+	if err != nil {
+		return err
+	}
+	if platformRelease != nil {
+		release = platformRelease
+		var total int64
+		for _, asset := range release.Assets {
+			total += asset.Size
+		}
+		fmt.Printf("  下载来源: GitHub 同版本平台资产 (%.2f MiB)\n", float64(total)/1024/1024)
+	}
+
+	// --dry-run: preview only. Resolve the platform asset so a missing build is
+	// still reported, then describe the steps that *would* run and return before
+	// any side effect (no backup, no download, no replace). Matches the global
+	// flag's contract: "预览操作内容，不实际执行".
+	if opts.dryRun {
+		binaryAsset, err := findUpgradeBinary(release.Assets)
+		if err != nil {
+			return err
+		}
+		hasSkills := findUpgradeSkills(release.Assets) != nil && !opts.skipSkills
+		writeDryRunPlan(os.Stdout, currentVer, binaryAsset.Name, hasSkills)
+		return nil
 	}
 
 	if !opts.yes {
@@ -349,21 +490,26 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 		}
 	}
 
-	binaryAsset, err := upgrade.FindBinaryAsset(release.Assets)
+	binaryAsset, err := findUpgradeBinary(release.Assets)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp(upgrade.DownloadCacheDir(), "upgrade-*")
+	if err := ensureUpgradeDirs(); err != nil {
+		return fmt.Errorf("初始化目录结构失败: %w", err)
+	}
+	cleanupUpgradeStale()
+
+	tmpDir, err := upgradeMkdirTemp(upgrade.DownloadCacheDir(), "upgrade-*")
 	if err != nil {
-		tmpDir, err = os.MkdirTemp("", "dws-upgrade-*")
+		tmpDir, err = upgradeMkdirTemp("", "dws-upgrade-*")
 		if err != nil {
 			return fmt.Errorf("创建临时目录失败: %w", err)
 		}
 	}
-	defer os.RemoveAll(tmpDir)
+	defer upgradeRemoveAll(tmpDir)
 
-	hasSkills := upgrade.FindSkillsAsset(release.Assets) != nil && !opts.skipSkills
+	hasSkills := findUpgradeSkills(release.Assets) != nil && !opts.skipSkills
 	// Steps: 1.备份  2.下载  3.校验  4.解压验证  5.替换+安装
 	const totalSteps = 5
 	stepFmt := func(n int) string { return ugBold(fmt.Sprintf("[%d/%d]", n, totalSteps)) }
@@ -376,7 +522,7 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 
 	// --- Step 1: Backup ---
 	fmt.Printf("  %s 备份当前版本...", stepFmt(1))
-	rm := upgrade.NewRollbackManager()
+	rm := newUpgradeRollback()
 	_, backupErr := rm.Backup(strings.TrimPrefix(currentVer, "v"))
 	if backupErr != nil {
 		fmt.Printf(" %s %v\n", ugYellow("⚠"), backupErr)
@@ -384,59 +530,87 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 		fmt.Printf(" %s\n", ugGreen("✓"))
 	}
 
-	// Fetch checksums.txt (needed for strict verification of both binary and skills)
-	var checksumsContent string
-	checksumsAsset := upgrade.FindChecksumsAsset(release.Assets)
-	if checksumsAsset != nil {
-		checksumsPath := filepath.Join(tmpDir, "checksums.txt")
-		if _, dlErr := upgrade.Download(checksumsAsset.BrowserDownloadURL, checksumsPath); dlErr == nil {
-			if data, readErr := os.ReadFile(checksumsPath); readErr == nil {
-				checksumsContent = string(data)
+	var checksumsContent, binaryArchivePath, skillsZipPath string
+	if platformRelease != nil {
+		for _, asset := range release.Assets {
+			archivePath := filepath.Join(tmpDir, asset.Name)
+			err := downloadUpgradePlatformAsset(ctx, asset, archivePath, func(percent float64, downloaded, total int64) {
+				fmt.Printf("\r  %s 下载 %s [%s] %5.1f%% (%.2f/%.2f MiB)", stepFmt(2), asset.Name, ugCyan(progressBar(percent)), percent, float64(downloaded)/1024/1024, float64(total)/1024/1024)
+			})
+			fmt.Println()
+			if err != nil {
+				return fmt.Errorf("准备平台资产 %s 失败: %w", asset.Name, err)
+			}
+			if asset.Name == binaryAsset.Name {
+				binaryArchivePath = archivePath
+			} else {
+				skillsZipPath = archivePath
 			}
 		}
-	}
-
-	// --- Step 2: Download (binary + skills together) ---
-	sl := stepFmt(2)
-	progressPrefix := fmt.Sprintf("  %s 下载 %s", sl, ugCyan(binaryAsset.Name))
-	fmt.Print(progressPrefix)
-	start := time.Now()
-	binaryArchivePath := filepath.Join(tmpDir, binaryAsset.Name)
-	n, err := upgrade.DownloadWithProgress(ctx, binaryAsset.BrowserDownloadURL, binaryArchivePath,
-		func(percent float64, downloaded, total int64) {
-			bar := progressBar(percent)
-			fmt.Printf("\r  %s 下载 %s [%s] %5.1f%%", sl, ugCyan(binaryAsset.Name), ugCyan(bar), percent)
+	} else if release.NPM != nil {
+		fmt.Printf("  %s 下载并校验 npm 发布包...\n", stepFmt(2))
+		prepared, prepareErr := prepareUpgradeNPMPackage(ctx, *release.NPM, tmpDir, opts.skipSkills, func(percent float64, downloaded, total int64) {
+			fmt.Printf("\r  %s 下载 npm 发布包 [%s] %5.1f%% (%.1fMB)", stepFmt(2), ugCyan(progressBar(percent)), percent, float64(downloaded)/1024/1024)
 		})
-	if err != nil {
 		fmt.Println()
-		return fmt.Errorf("下载二进制失败: %w", err)
-	}
-	elapsed := time.Since(start)
-	clearLine := strings.Repeat(" ", 100)
-
-	var skillsZipPath string
-	if hasSkills {
-		skillsAsset := upgrade.FindSkillsAsset(release.Assets)
-		fmt.Printf("\r%s\r%s %s %s\n", clearLine, progressPrefix, ugGreen("✓"), ugDim(fmt.Sprintf("(%.1fMB, %.1fs)", float64(n)/1024/1024, elapsed.Seconds())))
-
-		fmt.Printf("        下载 %s...", ugCyan("dws-skills.zip"))
-		skillsZipPath = filepath.Join(tmpDir, "dws-skills.zip")
-		if _, dlErr := upgrade.Download(skillsAsset.BrowserDownloadURL, skillsZipPath); dlErr != nil {
-			fmt.Printf(" %s\n", ugRed("✗"))
-			return fmt.Errorf("技能包下载失败: %w", dlErr)
+		if prepareErr != nil {
+			return fmt.Errorf("准备 npm 发布包失败: %w", prepareErr)
 		}
-		fmt.Printf(" %s\n", ugGreen("✓"))
+		binaryArchivePath, skillsZipPath, checksumsContent = prepared.BinaryArchivePath, prepared.SkillsArchivePath, prepared.ChecksumsContent
 	} else {
-		fmt.Printf("\r%s\r%s %s %s\n", clearLine, progressPrefix, ugGreen("✓"), ugDim(fmt.Sprintf("(%.1fMB, %.1fs)", float64(n)/1024/1024, elapsed.Seconds())))
+		// Fetch checksums.txt (needed for strict verification of both binary and skills)
+		checksumsAsset := findUpgradeChecksums(release.Assets)
+		if checksumsAsset != nil {
+			checksumsPath := filepath.Join(tmpDir, "checksums.txt")
+			if _, dlErr := downloadUpgradeFile(checksumsAsset.BrowserDownloadURL, checksumsPath); dlErr == nil {
+				if data, readErr := upgradeReadFile(checksumsPath); readErr == nil {
+					checksumsContent = string(data)
+				}
+			}
+		}
+
+		// --- Step 2: Download (binary + skills together) ---
+		sl := stepFmt(2)
+		progressPrefix := fmt.Sprintf("  %s 下载 %s", sl, ugCyan(binaryAsset.Name))
+		fmt.Print(progressPrefix)
+		start := time.Now()
+		binaryArchivePath = filepath.Join(tmpDir, binaryAsset.Name)
+		n, err := downloadUpgradeProgress(ctx, binaryAsset.BrowserDownloadURL, binaryArchivePath,
+			func(percent float64, downloaded, total int64) {
+				bar := progressBar(percent)
+				fmt.Printf("\r  %s 下载 %s [%s] %5.1f%%", sl, ugCyan(binaryAsset.Name), ugCyan(bar), percent)
+			})
+		if err != nil {
+			fmt.Println()
+			return fmt.Errorf("下载二进制失败: %w", err)
+		}
+		elapsed := time.Since(start)
+		clearLine := strings.Repeat(" ", 100)
+
+		if hasSkills {
+			skillsAsset := findUpgradeSkills(release.Assets)
+			fmt.Printf("\r%s\r%s %s %s\n", clearLine, progressPrefix, ugGreen("✓"), ugDim(fmt.Sprintf("(%.1fMB, %.1fs)", float64(n)/1024/1024, elapsed.Seconds())))
+
+			fmt.Printf("        下载 %s...", ugCyan("dws-skills.zip"))
+			skillsZipPath = filepath.Join(tmpDir, "dws-skills.zip")
+			if _, dlErr := downloadUpgradeFile(skillsAsset.BrowserDownloadURL, skillsZipPath); dlErr != nil {
+				fmt.Printf(" %s\n", ugRed("✗"))
+				return fmt.Errorf("技能包下载失败: %w", dlErr)
+			}
+			fmt.Printf(" %s\n", ugGreen("✓"))
+		} else {
+			fmt.Printf("\r%s\r%s %s %s\n", clearLine, progressPrefix, ugGreen("✓"), ugDim(fmt.Sprintf("(%.1fMB, %.1fs)", float64(n)/1024/1024, elapsed.Seconds())))
+		}
+
 	}
 
 	// --- Step 3: Verify SHA256 (binary + skills together) ---
-	if err := strictVerifyFile(stepFmt(3), binaryArchivePath, binaryAsset.Name, binaryAsset.Digest, checksumsContent); err != nil {
+	if err := verifyUpgradeFile(stepFmt(3), binaryArchivePath, binaryAsset.Name, binaryAsset.Digest, checksumsContent); err != nil {
 		return err
 	}
 	if hasSkills {
-		skillsAsset := upgrade.FindSkillsAsset(release.Assets)
-		if err := strictVerifyFile("     ", skillsZipPath, "dws-skills.zip", skillsAsset.Digest, checksumsContent); err != nil {
+		skillsAsset := findUpgradeSkills(release.Assets)
+		if err := verifyUpgradeFile("     ", skillsZipPath, "dws-skills.zip", skillsAsset.Digest, checksumsContent); err != nil {
 			return err
 		}
 	}
@@ -445,35 +619,41 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 	fmt.Printf("  %s 解压并验证...", stepFmt(4))
 	extractDir := filepath.Join(tmpDir, "extracted")
 	if strings.HasSuffix(binaryAsset.Name, ".zip") {
-		if err := upgrade.ExtractZip(binaryArchivePath, extractDir); err != nil {
+		if err := extractUpgradeZip(binaryArchivePath, extractDir); err != nil {
 			fmt.Println()
 			return fmt.Errorf("解压失败: %w", err)
 		}
 	} else {
-		if err := extractTarGz(binaryArchivePath, extractDir); err != nil {
+		if err := extractUpgradeTarGz(binaryArchivePath, extractDir); err != nil {
 			fmt.Println()
 			return fmt.Errorf("解压失败: %w", err)
 		}
 	}
-	binaryPath := upgrade.FindBinaryInDir(extractDir)
+	binaryPath := findExtractedBinary(extractDir)
 	if binaryPath == "" {
 		fmt.Println()
 		return fmt.Errorf("在解压目录中未找到 dws 二进制文件")
 	}
-	if err := validateNewBinary(binaryPath, release.Version); err != nil {
+	if err := validateUpgradeBinary(binaryPath, release.Version); err != nil {
 		fmt.Println()
 		return fmt.Errorf("验证失败: %w", err)
+	}
+	if release.NPM != nil {
+		out, versionErr := upgradeTryExecVersion(binaryPath)
+		if versionErr != nil || !upgradeOutputHasVersion(string(out), release.Version) {
+			return fmt.Errorf("npm 二进制版本未确认为 %s，未执行替换", release.Version)
+		}
 	}
 
 	var skillSrc string
 	if hasSkills {
 		skillsExtractDir := filepath.Join(tmpDir, "skills-extracted")
-		os.MkdirAll(skillsExtractDir, 0755)
-		if err := upgrade.ExtractZip(skillsZipPath, skillsExtractDir); err != nil {
+		_ = upgradeMkdirAll(skillsExtractDir, 0755)
+		if err := extractUpgradeZip(skillsZipPath, skillsExtractDir); err != nil {
 			fmt.Println()
 			return fmt.Errorf("技能包解压失败 (文件可能损坏，请检查网络后重试): %w", err)
 		}
-		skillSrc = upgrade.LocateSkillMD(skillsExtractDir)
+		skillSrc = locateUpgradeSkill(skillsExtractDir)
 		if skillSrc == "" {
 			fmt.Println()
 			return fmt.Errorf("技能包结构异常 (未找到 SKILL.md)，请反馈到 GitHub Issues")
@@ -487,13 +667,18 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 
 	// --- Step 5: Replace binary + install skills ---
 	fmt.Printf("  %s 替换并安装...", stepFmt(5))
-	if err := upgrade.ReplaceSelf(binaryPath); err != nil {
+	if err := replaceUpgradeSelf(binaryPath); err != nil {
 		fmt.Printf(" %s\n", ugRed("✗"))
 		return fmt.Errorf("替换二进制失败: %w", err)
 	}
+	// Drop persisted Schema identity so the next process regenerates from the
+	// newly installed binary's live declarations (no compile-time seal).
+	invalidateSchemaCacheAfterUpgrade()
 
 	if hasSkills {
-		result, installErr := upgrade.UpgradeSkillLocations(skillSrc)
+		result, installErr := installUpgradeSkills(skillSrc, upgrade.SkillUpgradeOptions{
+			Version: release.Version,
+		})
 		if installErr != nil {
 			fmt.Printf(" %s\n", ugRed("✗"))
 			return fmt.Errorf("技能包安装失败: %w", installErr)
@@ -513,9 +698,14 @@ func runUpgrade(ctx context.Context, opts upgradeOptions) error {
 		for _, d := range succeeded {
 			fmt.Printf("         %s %s\n", ugDim("→"), ugCyan(shortenHome(d.Dir)))
 		}
+		for _, d := range result.RetireWarnings() {
+			fmt.Printf("       %s %s %s\n", ugYellow("⚠"), shortenHome(d.Dir), ugDim("旧副本未能迁移，可手动删除: "+d.Err.Error()))
+		}
 	} else {
 		fmt.Printf(" %s\n", ugGreen("✓"))
 	}
+
+	// Discovery cache purge removed — static endpoint mode has no discovery cache.
 
 	// Cleanup old backups
 	rm.Cleanup(5)
@@ -569,24 +759,29 @@ func strictVerifyFile(label, filePath, fileName, assetDigest, checksumsContent s
 
 // validateNewBinary checks the downloaded binary is valid.
 func validateNewBinary(binaryPath, expectedVersion string) error {
-	info, err := os.Stat(binaryPath)
+	info, err := upgradeStat(binaryPath)
 	if err != nil {
 		return fmt.Errorf("文件不存在: %w", err)
 	}
 	if info.Size() == 0 {
 		return fmt.Errorf("文件为空")
 	}
-	if err := os.Chmod(binaryPath, 0755); err != nil {
+	if err := upgradeChmod(binaryPath, 0755); err != nil {
 		return fmt.Errorf("设置执行权限失败: %w", err)
 	}
 
-	// Try running the binary
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx, binaryPath, "version").CombinedOutput()
+	out, err := upgradeTryExecVersion(binaryPath)
 	if err != nil {
-		return fmt.Errorf("二进制无法执行: %w", err)
+		// Apple Silicon kills unsigned arm64 binaries with SIGKILL via amfid.
+		// Repair the binary in-place (ad-hoc codesign + drop quarantine) and retry once.
+		if upgradeRuntimeGOOS == "darwin" && isLikelyAMFIKill(err) {
+			if repairErr := upgradeRepairDarwin(binaryPath); repairErr == nil {
+				out, err = upgradeTryExecVersion(binaryPath)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("二进制无法执行: %w", err)
+		}
 	}
 
 	if !strings.Contains(string(out), expectedVersion) {
@@ -596,11 +791,42 @@ func validateNewBinary(binaryPath, expectedVersion string) error {
 	return nil
 }
 
+func tryExecVersion(binaryPath string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return upgradeChildCommand(ctx, binaryPath, "version").CombinedOutput()
+}
+
+// isLikelyAMFIKill returns true when err looks like macOS amfid SIGKILL'ing an
+// unsigned binary. Go reports this as "signal: killed".
+func isLikelyAMFIKill(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "signal: killed") || strings.Contains(msg, "signal: kill")
+}
+
+// repairDarwinBinary applies an ad-hoc codesign and clears the quarantine xattr.
+// Used as a self-heal step when an unsigned binary is killed by amfid on Apple Silicon.
+func repairDarwinBinary(binaryPath string) error {
+	// Best-effort: strip quarantine. Failure is fine (attribute often absent).
+	_, _ = upgradeCommandOutput("xattr", "-d", "com.apple.quarantine", binaryPath)
+
+	if _, err := upgradeLookPath("codesign"); err != nil {
+		return fmt.Errorf("codesign 不可用: %w", err)
+	}
+	out, err := upgradeCommandOutput("codesign", "--force", "--sign", "-", binaryPath)
+	if err != nil {
+		return fmt.Errorf("codesign 失败: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // extractTarGz extracts a .tar.gz file using the system tar command.
 func extractTarGz(archivePath, destDir string) error {
-	os.MkdirAll(destDir, 0755)
-	cmd := exec.Command("tar", "xzf", archivePath, "-C", destDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	_ = upgradeMkdirAll(destDir, 0755)
+	if out, err := upgradeCommandOutput("tar", "xzf", archivePath, "-C", destDir); err != nil {
 		return fmt.Errorf("tar 解压失败: %v: %s", err, string(out))
 	}
 	return nil
@@ -726,6 +952,34 @@ func ensureV(ver string) string {
 	return ver
 }
 
+func upgradeTrack(beta bool) upgrade.ReleaseTrack {
+	if beta {
+		return upgrade.ReleaseTrackBeta
+	}
+	return upgrade.ReleaseTrackRelease
+}
+
+func upgradeTrackSuffix(track upgrade.ReleaseTrack) string {
+	if track == upgrade.ReleaseTrackBeta {
+		return " (beta)"
+	}
+	return ""
+}
+
+func upgradeTrackVersionName(track upgrade.ReleaseTrack) string {
+	if track == upgrade.ReleaseTrackBeta {
+		return "beta 版本"
+	}
+	return "正式 release 版本"
+}
+
+func upgradeHintForTrack(track upgrade.ReleaseTrack) string {
+	if track == upgrade.ReleaseTrackBeta {
+		return "运行 dws upgrade --beta 进行升级"
+	}
+	return "运行 dws upgrade 进行升级"
+}
+
 // resolveUpgradeFormat returns "json" only when the user explicitly passes -f json.
 // Unlike other commands, upgrade defaults to table (human-friendly) output.
 func resolveUpgradeFormat(cmd *cobra.Command) string {
@@ -745,7 +999,7 @@ func writeJSON(w interface{ Write([]byte) (int, error) }, v any) error {
 }
 
 func shortenHome(path string) string {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := upgradeUserHomeDir()
 	if err != nil {
 		return path
 	}

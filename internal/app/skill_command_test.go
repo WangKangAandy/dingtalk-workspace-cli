@@ -28,6 +28,7 @@ import (
 	"time"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/testseam"
 )
 
 func TestResolveSkillTargetPath(t *testing.T) {
@@ -57,19 +58,19 @@ func TestResolveSkillTargetPath(t *testing.T) {
 		{
 			name:       "cursor target",
 			target:     "cursor",
-			wantSuffix: filepath.Join(".cursor", "skills"),
+			wantSuffix: filepath.Join(".agents", "skills"),
 			wantErr:    false,
 		},
 		{
 			name:       "codex target",
 			target:     "codex",
-			wantSuffix: filepath.Join(".codex", "skills"),
+			wantSuffix: filepath.Join(".agents", "skills"),
 			wantErr:    false,
 		},
 		{
 			name:       "opencode target",
 			target:     "opencode",
-			wantSuffix: filepath.Join(".config", "opencode", "skills"),
+			wantSuffix: filepath.Join(".agents", "skills"),
 			wantErr:    false,
 		},
 		{
@@ -115,6 +116,37 @@ func TestResolveSkillTargetPath(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCrossPlatformCoverageUniversalSkillInstallTargetsUseCanonical(t *testing.T) {
+	home := t.TempDir()
+	testseam.Swap(t, &skillUserHomeDir, func() (string, error) { return home, nil })
+	if isUniversalSkillInstallTarget("missing-agent") {
+		t.Fatal("unknown Agent target classified as universal")
+	}
+	for _, target := range []string{
+		"amp", "antigravity", "antigravity-cli", "cline", "codex", "cursor",
+		"deepagents", "dexto", "firebender", "gemini", "gemini-cli", "github",
+		"github-copilot", "kimi-code-cli", "loaf", "opencode", "replit",
+		"universal", "warp", "zed",
+	} {
+		got, err := resolveSkillTargetPath(target)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", target, err)
+		}
+		if want := filepath.Join(home, ".agents", "skills"); got != want {
+			t.Errorf("resolve %s = %s, want canonical %s", target, got, want)
+		}
+	}
+	for target, want := range map[string]string{
+		"claude": filepath.Join(home, ".claude", "skills"),
+		"qoder":  filepath.Join(home, ".qoder", "skills"),
+		"zcode":  filepath.Join(home, ".zcode", "skills"),
+	} {
+		if got, err := resolveSkillTargetPath(target); err != nil || got != want {
+			t.Errorf("resolve non-universal %s = %s, %v; want %s", target, got, err, want)
+		}
 	}
 }
 
@@ -367,21 +399,11 @@ func TestSkillInstallCommandValidation(t *testing.T) {
 }
 
 func TestSkillInstallInvalidTarget(t *testing.T) {
-	// Setup: Create config directory with valid token
 	tempDir := t.TempDir()
+	t.Cleanup(CloseFileLogger)
 	configDir := filepath.Join(tempDir, "config")
 	t.Setenv("DWS_CONFIG_DIR", configDir)
-
-	// Save a valid token
-	err := authpkg.SaveTokenData(configDir, &authpkg.TokenData{
-		AccessToken:  "test-token",
-		RefreshToken: "refresh-token",
-		ExpiresAt:    time.Now().Add(time.Hour),
-		RefreshExpAt: time.Now().Add(24 * time.Hour),
-	})
-	if err != nil {
-		t.Skipf("SaveTokenData() unavailable in this environment: %v", err)
-	}
+	t.Cleanup(CloseFileLogger)
 
 	cmd := NewRootCommand()
 	cmd.SetArgs([]string{"skill", "install", "skill-123", "invalid-target"})
@@ -390,7 +412,7 @@ func TestSkillInstallInvalidTarget(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 
-	err = cmd.Execute()
+	err := cmd.Execute()
 	if err == nil {
 		t.Error("Execute() should have failed for invalid target")
 	}
@@ -402,8 +424,15 @@ func TestSkillInstallInvalidTarget(t *testing.T) {
 func TestSkillInstallRequiresAuth(t *testing.T) {
 	// Setup: Create config directory without token
 	tempDir := t.TempDir()
+	t.Cleanup(CloseFileLogger)
 	configDir := filepath.Join(tempDir, "config")
 	t.Setenv("DWS_CONFIG_DIR", configDir)
+	t.Cleanup(CloseFileLogger)
+	originalResolveToken := skillResolveAccessToken
+	skillResolveAccessToken = func(context.Context, string, string) (string, error) {
+		return "", authpkg.ErrTokenDataNotFound
+	}
+	t.Cleanup(func() { skillResolveAccessToken = originalResolveToken })
 
 	// Ensure the config directory exists but has no token
 	if err := os.MkdirAll(configDir, 0755); err != nil {
@@ -452,11 +481,42 @@ func TestFetchSkillDownloadInfoUnauthorized(t *testing.T) {
 func TestSupportedTargets(t *testing.T) {
 	targets := supportedTargets()
 
-	// Should contain all predefined targets
-	expectedTargets := []string{"qoder", "claude", "cursor", "codex", "opencode", "."}
+	// Should contain all predefined targets — including the agents/* sentinel
+	// and the IDE/agent registries we share with skillSetupAgentHomes.
+	expectedTargets := []string{
+		"agents", "claude", "cursor", "codex", "zcode", "opencode", "qoder",
+		"gemini", "github", "windsurf", "augment", "cline",
+		"amp", "kiro", "trae", "openclaw", "hermes",
+		".",
+	}
 	for _, expected := range expectedTargets {
 		if !strings.Contains(targets, expected) {
 			t.Errorf("supportedTargets() should contain %s, got: %s", expected, targets)
+		}
+	}
+}
+
+// TestAgentSkillPathsCoversSetupHomes guards against drift between
+// agentSkillPaths (used by `dws skill install` and `dws skill setup
+// --target <name>`) and skillSetupAgentHomes (used by `dws skill setup
+// --target all` to detect candidate agent homes).
+//
+// Every path in skillSetupAgentHomes MUST be reachable via at least one
+// entry in agentSkillPaths — otherwise `--target all` would silently
+// install into agent homes that the user cannot address by name.
+func TestAgentSkillPathsCoversSetupHomes(t *testing.T) {
+	paths := make(map[string]bool, len(agentSkillPaths))
+	for _, p := range agentSkillPaths {
+		paths[p] = true
+	}
+	legacyCleanupOnly := map[string]bool{
+		".github/skills": true, ".windsurf/skills": true,
+		".cline/skills": true, ".amp/skills": true,
+	}
+	for _, home := range skillSetupAgentHomes {
+		if !paths[home] && !legacyCleanupOnly[home] {
+			t.Errorf("skillSetupAgentHomes entry %q has no matching agentSkillPaths value — "+
+				"add it to agentSkillPaths so users can address it via --target <name>", home)
 		}
 	}
 }
@@ -623,6 +683,87 @@ func TestSkillSearchCommandValidation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "required flag") {
 		t.Fatalf("error = %v, want required flag message", err)
+	}
+}
+
+func TestSkillSearchHelpUsesWukongSourceAndKeepsScopesHidden(t *testing.T) {
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"skill", "search", "--help"})
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	help := out.String()
+	if !strings.Contains(help, "--source") {
+		t.Fatalf("help missing --source:\n%s", help)
+	}
+	if strings.Contains(help, "--scopes") {
+		t.Fatalf("deprecated --scopes should stay hidden from help:\n%s", help)
+	}
+
+	search := mustFindCommand(t, NewRootCommand(), "skill", "search")
+	if search.Flags().Lookup("scopes") == nil {
+		t.Fatal("skill search missing hidden compatibility --scopes")
+	}
+}
+
+func TestSkillSearchUsesSourceQueryAndKeepsScopesCompat(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "config")
+	t.Setenv("DWS_CONFIG_DIR", configDir)
+	t.Cleanup(CloseFileLogger)
+	originalResolveToken := skillResolveAccessToken
+	skillResolveAccessToken = func(context.Context, string, string) (string, error) {
+		return "test-token", nil
+	}
+	t.Cleanup(func() { skillResolveAccessToken = originalResolveToken })
+
+	var gotSources []string
+	var gotScopes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cli/find-skills" {
+			t.Fatalf("path = %q, want /cli/find-skills", r.URL.Path)
+		}
+		if got := r.Header.Get("x-user-access-token"); got != "test-token" {
+			t.Fatalf("x-user-access-token = %q, want test-token", got)
+		}
+		q := r.URL.Query()
+		gotSources = append(gotSources, q.Get("source"))
+		gotScopes = append(gotScopes, q.Get("scopes"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":[]}`))
+	}))
+	defer server.Close()
+	t.Setenv("DWS_SKILL_API_HOST", server.URL)
+
+	run := func(args ...string) {
+		t.Helper()
+		defer CloseFileLogger()
+		cmd := NewRootCommand()
+		cmd.SetArgs(args)
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute(%v) error = %v\n%s", args, err, out.String())
+		}
+	}
+
+	run("skill", "search", "--query", "周报", "--source", "OrgInternal", "--format", "json")
+	run("skill", "search", "--query", "周报", "--scopes", "DingtalkMarket", "--format", "json")
+
+	if len(gotSources) != 2 {
+		t.Fatalf("request count = %d, want 2", len(gotSources))
+	}
+	if gotSources[0] != "OrgInternal" || gotSources[1] != "DingtalkMarket" {
+		t.Fatalf("source query values = %#v, want OrgInternal/DingtalkMarket", gotSources)
+	}
+	if gotScopes[0] != "" || gotScopes[1] != "" {
+		t.Fatalf("deprecated scopes must be normalized to source query, got scopes=%#v", gotScopes)
 	}
 }
 

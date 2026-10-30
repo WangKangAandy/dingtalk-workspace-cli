@@ -14,6 +14,7 @@
 package app
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
 	"strings"
@@ -32,8 +33,12 @@ func TestFlagErrorWithSuggestions_authStructured(t *testing.T) {
 	if !stderrors.As(err, &ae) {
 		t.Fatalf("want *apperrors.Error, got %T", err)
 	}
-	if ae.Message != orig.Error() {
-		t.Fatalf("Message = %q, want %q", ae.Message, orig.Error())
+	if !strings.Contains(ae.Message, orig.Error()) {
+		t.Fatalf("Message = %q, want to contain %q", ae.Message, orig.Error())
+	}
+	// 尾部 hint：所有 flag 解析错误的 Message 都应以 See '<cmd> --help' for usage. 结尾
+	if !strings.HasSuffix(ae.Message, "See 'login --help' for usage.") {
+		t.Fatalf("Message tail = %q, want suffix See 'login --help' for usage.", ae.Message)
 	}
 	if ae.Reason != "unknown_flag" {
 		t.Fatalf("Reason = %q, want unknown_flag", ae.Reason)
@@ -71,5 +76,148 @@ func TestFlagErrorWithSuggestions_unknownFlagHintAndFlags(t *testing.T) {
 	}
 	if len(ae.AvailableFlags) != 1 || ae.AvailableFlags[0] != "start" {
 		t.Fatalf("AvailableFlags = %v, want [start]", ae.AvailableFlags)
+	}
+	// 尾部 hint 验证：非 alias 路径（SuggestFlagFix 命中）同样应带 See '... --help' for usage.
+	if !strings.HasSuffix(ae.Message, "See 'list --help' for usage.") {
+		t.Fatalf("Message tail = %q, want suffix See 'list --help' for usage.", ae.Message)
+	}
+}
+
+func TestFlagErrorWithSuggestionsChatFromExplainsBothMeanings(t *testing.T) {
+	t.Parallel()
+	root := &cobra.Command{Use: "dws"}
+	chat := &cobra.Command{Use: "chat"}
+	search := &cobra.Command{Use: "+search-msg", Run: func(*cobra.Command, []string) {}}
+	search.Flags().String("sender", "", "sender target")
+	search.Flags().String("start", "", "start time")
+	root.AddCommand(chat)
+	chat.AddCommand(search)
+
+	orig := fmt.Errorf("unknown flag: --from")
+	err := flagErrorWithSuggestions(search, orig)
+	var ae *apperrors.Error
+	if !stderrors.As(err, &ae) {
+		t.Fatalf("want *apperrors.Error, got %T", err)
+	}
+	if ae.Reason != "ambiguous_flag" || !strings.Contains(ae.Hint, "--sender") || !strings.Contains(ae.Hint, "--start") {
+		t.Fatalf("structured error = reason %q hint %q", ae.Reason, ae.Hint)
+	}
+	if !strings.HasSuffix(ae.Message, "See 'dws chat +search-msg --help' for usage.") {
+		t.Fatalf("Message = %q", ae.Message)
+	}
+
+	for _, flag := range []string{"from-file", "from-user"} {
+		t.Run(flag, func(t *testing.T) {
+			err := flagErrorWithSuggestions(search, fmt.Errorf("unknown flag: --%s", flag))
+			var structured *apperrors.Error
+			if stderrors.As(err, &structured) && structured.Reason == "ambiguous_flag" {
+				t.Fatalf("--%s incorrectly used --from ambiguity handling: %#v", flag, structured)
+			}
+			if strings.Contains(err.Error(), "--from 在消息查询中含义不明确") {
+				t.Fatalf("--%s incorrectly received --from ambiguity hint: %v", flag, err)
+			}
+			if !strings.Contains(err.Error(), "unknown flag: --"+flag) {
+				t.Fatalf("error = %q, want original flag --%s", err, flag)
+			}
+		})
+	}
+}
+
+// TestCrossPlatformCoverageFlagErrorWithSuggestionsFallbackTailHint 验证 fallback 路径（非 unknown flag 类错误，
+// 如 missing required flag / ambiguous shorthand）也带尾部 See '<cmd> --help' for usage.
+// 这是 wukong / docker / kubectl 的通用 UX——任何 flag 解析错误都给用户一条 help 入口。
+func TestCrossPlatformCoverageFlagErrorWithSuggestionsFallbackTailHint(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{Use: "send", Run: func(*cobra.Command, []string) {}}
+	orig := fmt.Errorf("required flag(s) \"to\" not set")
+	err := flagErrorWithSuggestions(cmd, orig)
+	var ae *apperrors.Error
+	if !stderrors.As(err, &ae) {
+		t.Fatalf("fallback path should return *apperrors.Error, got %T: %v", err, err)
+	}
+	if ae.Category != apperrors.CategoryValidation || ae.Reason != "invalid_flag" {
+		t.Fatalf("fallback category/reason = %q/%q, want validation/invalid_flag", ae.Category, ae.Reason)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, orig.Error()) {
+		t.Fatalf("err = %q, want to contain orig %q", msg, orig.Error())
+	}
+	if !strings.HasSuffix(msg, "See 'send --help' for usage.") {
+		t.Fatalf("err tail = %q, want suffix See 'send --help' for usage.", msg)
+	}
+}
+
+func TestCrossPlatformCoverageFlagErrorWithSuggestionsPreservesCancellation(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{Use: "send", Run: func(*cobra.Command, []string) {}}
+	err := flagErrorWithSuggestions(cmd, fmt.Errorf("unknown flag: --json: %w", context.Canceled))
+	if !stderrors.Is(err, context.Canceled) {
+		t.Fatalf("flag error lost cancellation: %v", err)
+	}
+	var typed *apperrors.Error
+	if stderrors.As(err, &typed) {
+		t.Fatalf("cancellation was relabeled as validation: %#v", typed)
+	}
+}
+
+func TestFlagErrorWithSuggestionsReviewedProtectionRoutes(t *testing.T) {
+	root := NewRootCommand()
+	for _, tc := range []struct {
+		path       []string
+		flag       string
+		wantReason string
+		wantHint   string
+	}{
+		{path: []string{"chat", "message", "list-by-sender"}, flag: "time", wantReason: "blocked_flag", wantHint: "blocked"},
+		{path: []string{"drive", "list"}, flag: "space", wantReason: "ambiguous_flag", wantHint: "ambiguous"},
+	} {
+		t.Run(strings.Join(tc.path, "/"), func(t *testing.T) {
+			cmd := mustFindCommand(t, root, tc.path...)
+			err := flagErrorWithSuggestions(cmd, fmt.Errorf("unknown flag: --%s", tc.flag))
+			var ae *apperrors.Error
+			if !stderrors.As(err, &ae) {
+				t.Fatalf("want *apperrors.Error, got %T", err)
+			}
+			if ae.Reason != tc.wantReason || !strings.Contains(ae.Hint, tc.wantHint) || !strings.Contains(ae.Hint, "--help") {
+				t.Fatalf("protected error = reason %q hint %q", ae.Reason, ae.Hint)
+			}
+		})
+	}
+}
+
+func TestReviewedFlagProtectionAndInstallerEdges(t *testing.T) {
+	if flag, protection, ok := reviewedFlagProtection(nil, "unknown flag: --time"); ok || flag != "" || protection != "" {
+		t.Fatalf("nil command protection = %q, %q, %v", flag, protection, ok)
+	}
+	installReviewedFlagProtectionHandlers(nil)
+
+	root := NewRootCommand()
+	cmd := mustFindCommand(t, root, "chat", "message", "list-by-sender")
+	flag, protection, ok := reviewedFlagProtection(cmd, "unknown flag: --time=value")
+	if !ok || flag != "time" || protection != "blocked" {
+		t.Fatalf("delimited protected flag = %q, %q, %v", flag, protection, ok)
+	}
+	if flag, protection, ok := reviewedFlagProtection(cmd, "unknown flag: --not-reviewed"); ok || flag != "" || protection != "" {
+		t.Fatalf("unreviewed flag protection = %q, %q, %v", flag, protection, ok)
+	}
+}
+
+func TestReviewedFlagProtectionInstallerPreservesLocalHandler(t *testing.T) {
+	root := NewRootCommand()
+	cmd := mustFindCommand(t, root, "contact", "dept", "list-children")
+	handler := cmd.FlagErrorFunc()
+
+	unreviewed := handler(cmd, fmt.Errorf("unknown flag: --not-reviewed"))
+	var structured *apperrors.Error
+	if !stderrors.As(unreviewed, &structured) || structured.Reason != "invalid_flag" {
+		t.Fatalf("unreviewed error was not normalized after the local handler: %#v", structured)
+	}
+	if !strings.HasSuffix(unreviewed.Error(), "See 'dws contact dept list-children --help' for usage.") {
+		t.Fatalf("local handler output = %q", unreviewed)
+	}
+
+	guarded := handler(cmd, fmt.Errorf("unknown flag: --name"))
+	if !stderrors.As(guarded, &structured) || structured.Reason != "blocked_flag" {
+		t.Fatalf("reviewed guard did not use the central handler: %#v", guarded)
 	}
 }

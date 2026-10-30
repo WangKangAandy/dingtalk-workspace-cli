@@ -39,11 +39,30 @@ type Loader struct {
 	CLIVersion string
 }
 
+var (
+	pluginUserHomeDir = os.UserHomeDir
+	pluginReadDir     = os.ReadDir
+	pluginMkdirTemp   = os.MkdirTemp
+	pluginRemoveAll   = os.RemoveAll
+	pluginMkdirAll    = os.MkdirAll
+	pluginReadFile    = os.ReadFile
+	pluginWriteFile   = os.WriteFile
+	pluginRemove      = os.Remove
+	pluginWalk        = filepath.Walk
+	pluginRel         = filepath.Rel
+	pluginCopyDir     = copyDir
+	pluginRunBuild    = runBuild
+)
+
 // NewLoader creates a Loader with default paths.
 func NewLoader(cliVersion string) *Loader {
-	home, _ := os.UserHomeDir()
+	configDir := strings.TrimSpace(os.Getenv("DWS_CONFIG_DIR"))
+	if configDir == "" {
+		home, _ := pluginUserHomeDir()
+		configDir = filepath.Join(home, ".dws")
+	}
 	return &Loader{
-		PluginsDir: filepath.Join(home, ".dws", "plugins"),
+		PluginsDir: filepath.Join(configDir, "plugins"),
 		CLIVersion: cliVersion,
 	}
 }
@@ -63,7 +82,7 @@ func (l *Loader) LoadUser() []*Plugin {
 
 	var plugins []*Plugin
 	// User plugins may be nested: user/{workspace}/{name}/
-	entries, err := os.ReadDir(userDir)
+	entries, err := pluginReadDir(userDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			slog.Debug("plugin: cannot read user dir", "path", userDir, "error", err)
@@ -87,7 +106,7 @@ func (l *Loader) LoadUser() []*Plugin {
 		}
 
 		// Otherwise treat as workspace directory: user/{workspace}/{name}/
-		subEntries, err := os.ReadDir(entryPath)
+		subEntries, err := pluginReadDir(entryPath)
 		if err != nil {
 			continue
 		}
@@ -120,13 +139,13 @@ func (l *Loader) loadPlugin(dir string) *Plugin {
 	manifestPath := filepath.Join(dir, "plugin.json")
 	manifest, err := ParseManifest(manifestPath)
 	if err != nil {
-		slog.Warn("plugin: failed to parse manifest",
+		slog.Debug("plugin: failed to parse manifest",
 			"path", manifestPath, "error", err)
 		return nil
 	}
 
 	if err := manifest.Validate(l.CLIVersion); err != nil {
-		slog.Warn("plugin: validation failed",
+		slog.Debug("plugin: validation failed",
 			"plugin", manifest.Name, "error", err)
 		return nil
 	}
@@ -235,7 +254,7 @@ func (l *Loader) collectUserPluginInfos(dir, prefix string, settings *Settings, 
 		return
 	}
 	// Workspace: dir is a workspace, iterate sub-plugins
-	subEntries, err := os.ReadDir(dir)
+	subEntries, err := pluginReadDir(dir)
 	if err != nil {
 		return
 	}
@@ -273,7 +292,7 @@ func (l *Loader) InstallFromDir(srcDir string) (*Plugin, error) {
 	}
 
 	destDir := filepath.Join(l.PluginsDir, "user", manifest.Name)
-	if err := copyDir(srcDir, destDir); err != nil {
+	if err := pluginCopyDir(srcDir, destDir); err != nil {
 		return nil, fmt.Errorf("install failed: %w", err)
 	}
 
@@ -282,7 +301,7 @@ func (l *Loader) InstallFromDir(srcDir string) (*Plugin, error) {
 
 	// Run build if configured (compile server to binary).
 	if manifest.Build != nil {
-		if err := runBuild(destDir, manifest.Build); err != nil {
+		if err := pluginRunBuild(destDir, manifest.Build); err != nil {
 			// Clean up on build failure.
 			_ = os.RemoveAll(destDir)
 			return nil, fmt.Errorf("plugin build failed: %w", err)
@@ -307,11 +326,11 @@ func (l *Loader) InstallFromGit(gitURL string) (*Plugin, error) {
 	}
 
 	// Clone to temp directory.
-	tmpDir, err := os.MkdirTemp("", "dws-plugin-git-*")
+	tmpDir, err := pluginMkdirTemp("", "dws-plugin-git-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer pluginRemoveAll(tmpDir)
 
 	cloneDir := filepath.Join(tmpDir, repoName)
 	cmd := exec.Command("git", "clone", "--depth", "1", gitURL, cloneDir)
@@ -336,17 +355,17 @@ func (l *Loader) InstallFromGit(gitURL string) (*Plugin, error) {
 	destDir := filepath.Join(l.PluginsDir, config.PluginUserDir, workspace, manifest.Name)
 
 	// Remove .git directory before copying.
-	_ = os.RemoveAll(filepath.Join(cloneDir, ".git"))
+	_ = pluginRemoveAll(filepath.Join(cloneDir, ".git"))
 
-	if err := copyDir(cloneDir, destDir); err != nil {
+	if err := pluginCopyDir(cloneDir, destDir); err != nil {
 		return nil, fmt.Errorf("install failed: %w", err)
 	}
 
 	// Run build if configured (compile server to binary).
 	if manifest.Build != nil {
-		if err := runBuild(destDir, manifest.Build); err != nil {
+		if err := pluginRunBuild(destDir, manifest.Build); err != nil {
 			// Clean up on build failure.
-			_ = os.RemoveAll(destDir)
+			_ = pluginRemoveAll(destDir)
 			return nil, fmt.Errorf("plugin build failed: %w", err)
 		}
 	}
@@ -413,13 +432,13 @@ func (l *Loader) RemovePlugin(name string, keepData bool) error {
 		return fmt.Errorf("plugin %q not found", name)
 	}
 
-	if err := os.RemoveAll(pluginDir); err != nil {
+	if err := pluginRemoveAll(pluginDir); err != nil {
 		return fmt.Errorf("failed to remove plugin: %w", err)
 	}
 
 	if !keepData {
 		dataDir := filepath.Join(l.PluginsDir, config.PluginDataDir, name)
-		_ = os.RemoveAll(dataDir)
+		_ = pluginRemoveAll(dataDir)
 	}
 
 	l.purgePluginFromSettings(name)
@@ -457,18 +476,11 @@ func (l *Loader) SetEnabled(name string, enabled bool) error {
 }
 
 func (l *Loader) findUserPluginDir(name string) string {
-	// Try direct: user/{name}/
+	// name may be direct ("plugin") or qualified ("workspace/plugin").
+	// filepath.Join handles both forms.
 	dir := filepath.Join(l.PluginsDir, "user", name)
 	if _, err := os.Stat(filepath.Join(dir, "plugin.json")); err == nil {
 		return dir
-	}
-	// Try workspace: user/{workspace}/{plugin}/
-	parts := strings.SplitN(name, "/", 2)
-	if len(parts) == 2 {
-		dir = filepath.Join(l.PluginsDir, "user", parts[0], parts[1])
-		if _, err := os.Stat(filepath.Join(dir, "plugin.json")); err == nil {
-			return dir
-		}
 	}
 	return ""
 }
@@ -569,7 +581,8 @@ func (l *Loader) ListPluginConfig(pluginName string) map[string]string {
 // in plugin.json headers, endpoints, etc.
 //
 // Environment variables already set by the user take precedence — only
-// keys not already present in the environment are injected.
+// keys not already present in the environment are injected. The return value
+// reports whether at least one value was injected.
 // dangerousEnvVars contains environment variable names that must never be
 // set from plugin config because they can alter process behavior in
 // security-critical ways (library injection, executable search path, etc.).
@@ -583,10 +596,11 @@ var dangerousEnvVars = map[string]bool{
 	"http_proxy": true, "https_proxy": true, "all_proxy": true, "no_proxy": true,
 }
 
-func (l *Loader) InjectPluginConfigEnv() {
+func (l *Loader) InjectPluginConfigEnv() bool {
 	settings := l.loadSettings()
+	injected := false
 	if len(settings.PluginConfigs) == 0 {
-		return
+		return false
 	}
 	for _, pluginCfg := range settings.PluginConfigs {
 		for key, val := range pluginCfg {
@@ -605,8 +619,10 @@ func (l *Loader) InjectPluginConfigEnv() {
 				continue
 			}
 			_ = os.Setenv(key, strVal)
+			injected = true
 		}
 	}
+	return injected
 }
 
 // LoadDev loads dev plugins registered via `dws plugin dev`.
@@ -663,7 +679,7 @@ func SyncSkills(plugins []*Plugin) {
 		return
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := pluginUserHomeDir()
 	if err != nil {
 		slog.Debug("plugin: cannot get home dir for skill sync", "error", err)
 		return
@@ -685,7 +701,7 @@ func SyncSkills(plugins []*Plugin) {
 		}
 
 		// Walk the plugin's skills directory and copy files to each agent dir.
-		entries, err := os.ReadDir(skillsDir)
+		entries, err := pluginReadDir(skillsDir)
 		if err != nil {
 			continue
 		}
@@ -703,7 +719,7 @@ func SyncSkills(plugins []*Plugin) {
 				// Place plugin skills under dws/plugins/{plugin-name}/
 				dest := filepath.Join(agentBase, "dws", "plugins", p.Manifest.Name, entry.Name())
 				if entry.IsDir() {
-					_ = copyDir(src, dest)
+					_ = pluginCopyDir(src, dest)
 				} else {
 					_ = os.MkdirAll(filepath.Dir(dest), 0o755)
 					data, readErr := os.ReadFile(src)
@@ -751,12 +767,7 @@ func runBuild(pluginDir string, build *BuildConfig) error {
 
 	slog.Info("plugin: building", "dir", pluginDir, "command", build.Command)
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/C", build.Command)
-	} else {
-		cmd = exec.Command("sh", "-c", build.Command)
-	}
+	cmd := buildCommandFor(runtime.GOOS, build.Command)
 	cmd.Dir = pluginDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -785,16 +796,23 @@ func runBuild(pluginDir string, build *BuildConfig) error {
 	return nil
 }
 
+func buildCommandFor(goos, command string) *exec.Cmd {
+	if goos == "windows" {
+		return exec.Command("cmd", "/C", command)
+	}
+	return exec.Command("sh", "-c", command)
+}
+
 // copyDir recursively copies src to dst, skipping files whose content
 // is identical to the destination. This avoids overwriting locked
 // executables (e.g. a running stdio plugin on Windows).
 // Symlinks are skipped for security (prevents path traversal attacks).
 func copyDir(src, dst string) error {
 	cleanDst := filepath.Clean(dst) + string(os.PathSeparator)
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := pluginMkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	return pluginWalk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -802,7 +820,7 @@ func copyDir(src, dst string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := pluginRel(src, path)
 		if err != nil {
 			return err
 		}
@@ -812,9 +830,9 @@ func copyDir(src, dst string) error {
 			return fmt.Errorf("path traversal detected: %s", rel)
 		}
 		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
+			return pluginMkdirAll(target, info.Mode())
 		}
-		data, err := os.ReadFile(path)
+		data, err := pluginReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -824,7 +842,7 @@ func copyDir(src, dst string) error {
 				return nil
 			}
 		}
-		return os.WriteFile(target, data, info.Mode())
+		return pluginWriteFile(target, data, info.Mode())
 	})
 }
 
@@ -832,11 +850,11 @@ func copyDir(src, dst string) error {
 // Best-effort: errors are logged but do not fail the install.
 func removeStaleFiles(src, dst string) {
 	srcSet := make(map[string]struct{})
-	_ = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	_ = pluginWalk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		rel, relErr := filepath.Rel(src, path)
+		rel, relErr := pluginRel(src, path)
 		if relErr != nil {
 			return nil
 		}
@@ -844,11 +862,11 @@ func removeStaleFiles(src, dst string) {
 		return nil
 	})
 
-	_ = filepath.Walk(dst, func(path string, info os.FileInfo, err error) error {
+	_ = pluginWalk(dst, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		rel, relErr := filepath.Rel(dst, path)
+		rel, relErr := pluginRel(dst, path)
 		if relErr != nil {
 			return nil
 		}
@@ -857,10 +875,10 @@ func removeStaleFiles(src, dst string) {
 		}
 		if _, exists := srcSet[rel]; !exists {
 			if info.IsDir() {
-				_ = os.RemoveAll(path)
+				_ = pluginRemoveAll(path)
 				return filepath.SkipDir
 			}
-			if removeErr := os.Remove(path); removeErr != nil {
+			if removeErr := pluginRemove(path); removeErr != nil {
 				slog.Debug("plugin: failed to remove stale file", "path", path, "error", removeErr)
 			}
 		}

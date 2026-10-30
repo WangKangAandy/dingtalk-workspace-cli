@@ -30,6 +30,13 @@ func TestClassifyDenialReason(t *testing.T) {
 			want: "channel_required",
 		},
 		{
+			name: "error ENTERPRISE_NOT_AUTHORIZED",
+			status: &CLIAuthStatus{
+				ErrorCode: "ENTERPRISE_NOT_AUTHORIZED",
+			},
+			want: "enterprise_not_authorized",
+		},
+		{
 			name: "error NO_AUTH",
 			status: &CLIAuthStatus{
 				ErrorCode: "NO_AUTH",
@@ -77,7 +84,7 @@ func TestClassifyDenialReason(t *testing.T) {
 					UserScope:       "specified",
 					AllowedUsers:    []string{"014566033934857460"},
 					ChannelScope:    "specified",
-					AllowedChannels: []string{"2a4a658e467998befb7fa333c19ba2b3a3bacfa4"},
+					AllowedChannels: []string{"channel-allowed"},
 				},
 			},
 			currentChannel: "different-channel",

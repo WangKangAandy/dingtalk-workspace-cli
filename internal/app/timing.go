@@ -55,6 +55,16 @@ const (
 	perfReportFile = "latest.json"
 )
 
+var (
+	timingMarshalIndent = json.MarshalIndent
+	timingMkdirAll      = os.MkdirAll
+	timingWriteFile     = os.WriteFile
+	timingRemove        = os.Remove
+	timingRename        = os.Rename
+	timingReadFile      = os.ReadFile
+	timingUserHomeDir   = os.UserHomeDir
+)
+
 // timingContextKey is the context key for TimingCollector.
 type timingContextKey struct{}
 
@@ -64,6 +74,7 @@ type TimingEntry struct {
 	Duration  time.Duration
 	Timestamp time.Time
 	Seq       int // insertion order
+	Nested    bool
 }
 
 // TimingCollector collects timing measurements for a single command execution.
@@ -85,6 +96,17 @@ func NewTimingCollector() *TimingCollector {
 
 // Record adds a timing entry with the given name and duration.
 func (tc *TimingCollector) Record(name string, d time.Duration) {
+	tc.record(name, d, false)
+}
+
+// RecordNested adds a diagnostic sub-phase. Nested phases are included in the
+// report but excluded from overhead accounting because their duration is
+// already covered by an enclosing top-level phase.
+func (tc *TimingCollector) RecordNested(name string, d time.Duration) {
+	tc.record(name, d, true)
+}
+
+func (tc *TimingCollector) record(name string, d time.Duration, nested bool) {
 	if tc == nil {
 		return
 	}
@@ -95,6 +117,7 @@ func (tc *TimingCollector) Record(name string, d time.Duration) {
 		Duration:  d,
 		Timestamp: time.Now(),
 		Seq:       tc.seq,
+		Nested:    nested,
 	})
 	tc.seq++
 }
@@ -202,6 +225,14 @@ func RecordTiming(ctx context.Context, name string, d time.Duration) {
 	}
 }
 
+// RecordNestedTiming records a diagnostic sub-phase without double-counting
+// it when BuildReport derives framework overhead.
+func RecordNestedTiming(ctx context.Context, name string, d time.Duration) {
+	if tc := TimingCollectorFromContext(ctx); tc != nil {
+		tc.RecordNested(name, d)
+	}
+}
+
 // StartTiming is a convenience function that returns a stop function for defer usage.
 // Example:
 //
@@ -226,6 +257,7 @@ type PerfPhase struct {
 	Name       string `json:"name"`
 	DurationMs int64  `json:"duration_ms"`
 	Seq        int    `json:"seq"`
+	Nested     bool   `json:"nested,omitempty"`
 }
 
 // PerfReport is the JSON-serialisable performance report.
@@ -258,8 +290,11 @@ func (tc *TimingCollector) BuildReport(cliVersion, command string) PerfReport {
 			Name:       e.Name,
 			DurationMs: ms,
 			Seq:        e.Seq,
+			Nested:     e.Nested,
 		}
-		sumMs += ms
+		if !e.Nested {
+			sumMs += ms
+		}
 		if ms > slowestMs {
 			slowestMs = ms
 			slowestName = e.Name
@@ -295,7 +330,7 @@ func (tc *TimingCollector) WriteReportIfEnabled(cliVersion, command string) {
 	}
 
 	report := tc.BuildReport(cliVersion, command)
-	data, err := json.MarshalIndent(report, "", "  ")
+	data, err := timingMarshalIndent(report, "", "  ")
 	if err != nil {
 		return
 	}
@@ -306,22 +341,22 @@ func (tc *TimingCollector) WriteReportIfEnabled(cliVersion, command string) {
 	}
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := timingMkdirAll(dir, 0o700); err != nil {
 		return
 	}
 
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		_ = os.Remove(tmp)
+	if err := timingWriteFile(tmp, data, 0o600); err != nil {
+		_ = timingRemove(tmp)
 		return
 	}
-	_ = os.Rename(tmp, path)
+	_ = timingRename(tmp, path)
 }
 
 // LoadLatestReport reads the default perf report file (~/.dws/perf/latest.json).
 func LoadLatestReport() (*PerfReport, error) {
 	path := defaultPerfReportPath()
-	data, err := os.ReadFile(path)
+	data, err := timingReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +376,7 @@ func resolvePerfReportPath(dest string) string {
 }
 
 func defaultPerfReportPath() string {
-	home, err := os.UserHomeDir()
+	home, err := timingUserHomeDir()
 	if err != nil {
 		return ""
 	}
@@ -350,9 +385,15 @@ func defaultPerfReportPath() string {
 
 // sensitiveFlags are flag names whose values should be masked in commands.
 var sensitiveFlags = map[string]bool{
-	"--token":         true,
-	"--client-secret": true,
-	"--client-id":     true,
+	"--delegator-user-id":          true,
+	"--delegator-corp-id":          true,
+	"--delegator-open-dingtalk-id": true,
+	"--token":                      true,
+	"--code":                       true,
+	"--state":                      true,
+	"--client-secret":              true,
+	"--client-id":                  true,
+	"--password":                   true,
 }
 
 // SanitizeCommand redacts sensitive flag values from a command arg slice.

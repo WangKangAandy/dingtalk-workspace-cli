@@ -1,0 +1,166 @@
+# 把本仓库 main 代码自动镜像到 Gitee，供国内用户访问 raw 脚本入口。
+# Release tag 与附件只由 release.yml 的受控 publication queue 发布。
+# 用 HTTPS + 令牌直接 git push（无需 SSH key），复用已配置的 secret：
+#   GITEE_TOKEN  —— Gitee 私人令牌（勾 projects）
+#   GITEE_USER   —— 令牌所属 Gitee 用户名（用于 https 推送鉴权）
+#   GITEE_REPO   —— "owner/repo"，如 DingTalk-Real-AI/dingtalk-workspace-cli
+# 未配置 GITEE_TOKEN 时（如 fork）自动跳过，不报红叉。
+name: Mirror code to Gitee
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      sync_release_version:
+        description: "Sync a specific release version's assets to Gitee (e.g. v1.0.55-beta.3)"
+        required: false
+        type: string
+
+concurrency:
+  group: gitee-code-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    if: ${{ github.ref_name == github.event.repository.default_branch && github.repository_owner == 'DingTalk-Real-AI' }}
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_USER: ${{ secrets.GITEE_USER }}
+      GITEE_REPO: ${{ secrets.GITEE_REPO }}
+    steps:
+      - name: Checkout main history
+        if: env.GITEE_TOKEN != ''
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Push localized main to Gitee
+        if: env.GITEE_TOKEN != ''
+        timeout-minutes: 15
+        run: |
+          set -eu
+          REMOTE="https://gitee.com/${GITEE_REPO}.git"
+          ASKPASS_DIR="$(mktemp -d)"
+          trap 'rm -rf "$ASKPASS_DIR"' EXIT
+          cat >"$ASKPASS_DIR/askpass.sh" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$GITEE_USER" ;;
+            *) printf '%s\n' "$GITEE_TOKEN" ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS_DIR/askpass.sh"
+          export GIT_ASKPASS="$ASKPASS_DIR/askpass.sh"
+          export GIT_TERMINAL_PROMPT=0
+
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+            git fetch --no-tags --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
+          else
+            git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          fi
+          SOURCE_COMMIT="$(git rev-parse origin/main)"
+
+          # The advertised Gitee tip is localized and absent from GitHub; fetch it to exclude shared history from the push pack.
+          MIRROR_COMMIT=""
+          if git ls-remote --exit-code --heads "$REMOTE" refs/heads/main >"$ASKPASS_DIR/main-ref"; then
+            git fetch --no-tags "$REMOTE" '+refs/heads/main:refs/remotes/gitee/main'
+            MIRROR_COMMIT="$(git rev-parse refs/remotes/gitee/main)"
+          else
+            status=$?
+            # Only exit 2 means a successful query found no matching ref. Transport/auth errors must stop the mirror.
+            if [ "$status" -ne 2 ]; then
+              printf '%s\n' "error: could not query Gitee main; push was not attempted" >&2
+              exit "$status"
+            fi
+            printf '%s\n' "Gitee main is missing — initialize with an absent-ref lease."
+          fi
+
+          git checkout -B gitee-main "$SOURCE_COMMIT"
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+
+          # 1) 安装命令本地化：raw.githubusercontent → gitee raw（国内可达）。
+          for f in README.md README_zh.md; do
+            [ -f "$f" ] || continue
+            sed -i "s#raw.githubusercontent.com/${GITEE_REPO}/main#gitee.com/${GITEE_REPO}/raw/main#g" "$f"
+          done
+
+          # 2) coverage 徽章：仓库内相对路径 svg 在 Gitee 渲染不出来（gitee raw 对 svg
+          #    返回需签名、会过期的 URL，且 content-type 为 text/plain）。改成 shields.io
+          #    静态徽章——数值取自仓库 coverage.svg，颜色按覆盖率阈值。
+          SVG=".github/badges/coverage.svg"
+          if [ -f "$SVG" ]; then
+            PCT="$(grep -oE '[0-9]+(\.[0-9]+)?%' "$SVG" | head -1)"
+            NUM="${PCT%\%}"; INT="${NUM%.*}"
+            if [ "${INT:-0}" -ge 80 ]; then C=brightgreen; elif [ "${INT:-0}" -ge 60 ]; then C=yellow; else C=red; fi
+            BADGE="https://img.shields.io/badge/coverage-${NUM}%25-${C}"
+            for f in README.md README_zh.md; do
+              [ -f "$f" ] || continue
+              sed -i "s#\.github/badges/coverage\.svg#${BADGE}#g" "$f"
+            done
+          fi
+
+          for f in README.md README_zh.md; do
+            [ -f "$f" ] || continue
+            git add -- "$f"
+          done
+          if [ -n "$MIRROR_COMMIT" ] &&
+             [ "$(git write-tree)" = "$(git rev-parse "${MIRROR_COMMIT}^{tree}")" ] &&
+             { [ "$MIRROR_COMMIT" = "$SOURCE_COMMIT" ] ||
+               [ "$(git rev-parse "${MIRROR_COMMIT}^" 2>/dev/null)" = "$SOURCE_COMMIT" ]; }; then
+            printf '%s\n' "Gitee main already aligned with ${SOURCE_COMMIT} — skip push."
+            exit 0
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "docs(gitee): localize install commands + coverage badge for Gitee mirror"
+          fi
+
+          # An empty expected value requires main to remain absent, rejecting a concurrent first writer too.
+          git push --progress "--force-with-lease=refs/heads/main:${MIRROR_COMMIT}" "$REMOTE" 'gitee-main:refs/heads/main'
+          printf '%s\n' "Mirrored localized main to Gitee ${GITEE_REPO}"
+
+      - name: Download GitHub Release assets
+        if: ${{ inputs.sync_release_version != '' }}
+        env:
+          VERSION: ${{ inputs.sync_release_version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          echo "📥 Downloading release assets for ${VERSION}"
+          mkdir -p dist
+          gh release download "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist \
+            --pattern 'dws-*' \
+            --pattern 'checksums.txt' \
+            --clobber
+          ls -la dist/
+
+      - name: Verify release artifacts
+        if: ${{ inputs.sync_release_version != '' }}
+        env:
+          VERSION: ${{ inputs.sync_release_version }}
+        run: |
+          set -eu
+          DWS_PACKAGE_DIST_DIR="$GITHUB_WORKSPACE/dist" \
+            ./scripts/release/verify-release-artifacts.sh "$VERSION"
+
+      - name: Sync release assets to Gitee
+        if: ${{ inputs.sync_release_version != '' }}
+        env:
+          VERSION: ${{ inputs.sync_release_version }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_USER: ${{ secrets.GITEE_USER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+          DIST_DIR: ${{ github.workspace }}/dist
+        run: |
+          set -eu
+          echo "📦 Syncing release assets for ${VERSION} to Gitee ${GITEE_REPO}"
+          ./scripts/release/sync-to-gitee.sh

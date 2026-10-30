@@ -15,10 +15,11 @@ package app
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"log/slog"
 
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/jsonutil"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
 )
 
@@ -30,28 +31,157 @@ type toolCallerAdapter struct {
 	flags  *GlobalFlags
 }
 
+var toolCallerDryRun = func(ctx context.Context, invocation executor.Invocation) (executor.Result, error) {
+	return (executor.EchoRunner{}).Run(ctx, invocation)
+}
+
 func newToolCallerAdapter(runner executor.Runner, flags *GlobalFlags) edition.ToolCaller {
 	return &toolCallerAdapter{runner: runner, flags: flags}
 }
 
 func (a *toolCallerAdapter) CallTool(ctx context.Context, productID, toolName string, args map[string]any) (*edition.ToolResult, error) {
 	inv := executor.NewHelperInvocation("overlay."+productID+"."+toolName, productID, toolName, args)
+	// Defense in depth for direct helper callers: global dry-run must never
+	// reach an injected/real Runner, even if a command bypasses the normal
+	// Schema leaf wrapper. EchoRunner produces the same stable dry_run envelope
+	// without catalog, auth, Keychain, endpoint or transport access.
+	if a != nil && a.DryRun() {
+		inv.DryRun = true
+		result, err := toolCallerDryRun(ctx, inv)
+		traceWhiteboardResponse(inv, "local_dry_run", result.Response, nil, err)
+		if err != nil {
+			return nil, err
+		}
+		return convertResult(result), nil
+	}
+	if a == nil || a.runner == nil {
+		return nil, fmt.Errorf("ToolCaller runner is not configured")
+	}
 	result, err := a.runner.Run(ctx, inv)
+	traceWhiteboardResponse(inv, "adapter_before_conversion", result.Response, nil, err)
 	if err != nil {
 		return nil, err
 	}
 	return convertResult(result), nil
 }
 
-func (a *toolCallerAdapter) Format() string {
+type toolProductResolver interface {
+	ResolveToolProduct(context.Context, []string, string) (string, error)
+}
+
+// ResolveToolProduct performs read-only capability discovery before dispatch.
+// It never probes availability by issuing tools/call, so a write is sent to at
+// most one selected service.
+func (a *toolCallerAdapter) ResolveToolProduct(ctx context.Context, productIDs []string, toolName string) (string, error) {
+	resolver, ok := a.runner.(toolProductResolver)
+	if !ok {
+		if len(productIDs) == 0 {
+			return "", fmt.Errorf("no MCP product candidates for tool %q", toolName)
+		}
+		return productIDs[0], nil
+	}
+	return resolver.ResolveToolProduct(ctx, productIDs, toolName)
+}
+
+type mcpToolCapabilityReader interface {
+	SupportsMCPTool(context.Context, string, string) (bool, error)
+}
+
+// SupportsMCPTool must not infer support merely from an available product route.
+func (a *toolCallerAdapter) SupportsMCPTool(ctx context.Context, product, tool string) (bool, error) {
+	reader, ok := a.runner.(mcpToolCapabilityReader)
+	if !ok {
+		return false, nil
+	}
+	return reader.SupportsMCPTool(ctx, product, tool)
+}
+
+type dryRunReadRunner interface {
+	RunReadOnly(context.Context, executor.Invocation) (executor.Result, error)
+}
+
+// CallReadTool executes a Shortcut's explicitly classified read lookup while
+// the outer command is in dry-run mode. Ordinary CallTool remains protected by
+// the global execution barrier. The runner capability is optional and fails
+// closed so an injected runner cannot accidentally receive a real call.
+func (a *toolCallerAdapter) CallReadTool(ctx context.Context, productID, toolName string, args map[string]any) (*edition.ToolResult, error) {
+	if a == nil || a.runner == nil {
+		return nil, fmt.Errorf("ToolCaller runner is not configured")
+	}
+	if !a.DryRun() {
+		return a.CallTool(ctx, productID, toolName, args)
+	}
+	readRunner, ok := a.runner.(dryRunReadRunner)
+	if !ok {
+		return nil, fmt.Errorf("ToolCaller runner does not support read-only dry-run lookups")
+	}
+	inv := executor.NewHelperInvocation("overlay."+productID+"."+toolName, productID, toolName, args)
+	result, err := readRunner.RunReadOnly(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
+	return convertResult(result), nil
+}
+
+type scopedTokenRunner interface {
+	RunWithToken(context.Context, executor.Invocation, string) (executor.Result, error)
+}
+
+// CallToolWithToken invokes a helper with a request-scoped in-memory token. It
+// is used during login before the new token has been persisted to any profile
+// slot. The runner capability is explicit so this path never falls back to
+// mutating the process-wide token flags or RuntimeProfile selector.
+func (a *toolCallerAdapter) CallToolWithToken(ctx context.Context, token, productID, toolName string, args map[string]any) (*edition.ToolResult, error) {
+	if a == nil || a.runner == nil || token == "" {
+		return nil, fmt.Errorf("ToolCaller token override is not configured")
+	}
+	runner, ok := a.runner.(scopedTokenRunner)
+	if !ok {
+		return nil, fmt.Errorf("ToolCaller runner does not support request-scoped token calls")
+	}
+	inv := executor.NewHelperInvocation("overlay."+productID+"."+toolName, productID, toolName, args)
+	result, err := runner.RunWithToken(ctx, inv, token)
+	if err != nil {
+		return nil, err
+	}
+	return convertResult(result), nil
+}
+
+// AccessToken resolves the same active-profile token used by MCP tool calls.
+func (a *toolCallerAdapter) AccessToken(ctx context.Context) (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("ToolCaller token resolver is not configured")
+	}
+	explicitToken := ""
 	if a.flags != nil {
+		explicitToken = a.flags.Token
+	}
+	return resolveRuntimeAuthToken(ctx, explicitToken)
+}
+
+func (a *toolCallerAdapter) Format() string {
+	if a != nil && a.flags != nil {
 		return a.flags.Format
 	}
 	return "json"
 }
 
 func (a *toolCallerAdapter) DryRun() bool {
-	return a.flags != nil && a.flags.DryRun
+	return a != nil && a.flags != nil && a.flags.DryRun
+}
+
+func (a *toolCallerAdapter) Fields() string {
+	if a != nil && a.flags != nil {
+		return a.flags.Fields
+	}
+	return ""
+}
+
+func (a *toolCallerAdapter) JQ() string {
+	if a != nil && a.flags != nil {
+		return a.flags.JQ
+	}
+	return ""
 }
 
 func convertResult(r executor.Result) *edition.ToolResult {
@@ -77,7 +207,7 @@ func convertResult(r executor.Result) *edition.ToolResult {
 	contentRaw, ok := resp["content"]
 	if !ok {
 		// Dry-run or echo mode: serialize the whole response as text.
-		data, _ := json.Marshal(resp)
+		data, _ := jsonutil.Marshal(resp)
 		return &edition.ToolResult{
 			Content: []edition.ContentBlock{{Type: "text", Text: string(data)}},
 		}
@@ -98,12 +228,12 @@ func convertResult(r executor.Result) *edition.ToolResult {
 		}
 		return &edition.ToolResult{Content: blocks}
 	case map[string]any:
-		data, _ := json.Marshal(v)
+		data, _ := jsonutil.Marshal(v)
 		return &edition.ToolResult{
 			Content: []edition.ContentBlock{{Type: "text", Text: string(data)}},
 		}
 	default:
-		data, _ := json.Marshal(contentRaw)
+		data, _ := jsonutil.Marshal(contentRaw)
 		return &edition.ToolResult{
 			Content: []edition.ContentBlock{{Type: "text", Text: string(data)}},
 		}

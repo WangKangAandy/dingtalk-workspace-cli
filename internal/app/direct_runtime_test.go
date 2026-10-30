@@ -1,96 +1,47 @@
 package app
 
 import (
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/market"
 )
 
-func TestDefaultPATServerDescriptorUsesBehaviorAuthorizationName(t *testing.T) {
-	server := defaultPATServerDescriptor()
-	if server.CLI.ID != "pat" {
-		t.Fatalf("default PAT server id = %q, want pat", server.CLI.ID)
-	}
-	if server.DisplayName != "行为授权" {
-		t.Fatalf("default PAT server display name = %q, want 行为授权", server.DisplayName)
-	}
-	if server.Endpoint != defaultPATMCPEndpoint() {
-		t.Fatalf("default PAT server endpoint = %q, want %q", server.Endpoint, defaultPATMCPEndpoint())
-	}
-}
+// mcpdev is a helper-only product: it is absent from the generated static
+// server table and from discovery, so the source pin is its only default
+// resolution path. These tests guard that pin and carry the macOS platform
+// coverage gate, so they use the TestCrossPlatformCoverage prefix.
 
-func TestDirectRuntimeProductIDsIncludesDefaultPAT(t *testing.T) {
-	dynamicMu.Lock()
-	previousProducts := dynamicProducts
-	dynamicProducts = nil
-	dynamicMu.Unlock()
-	t.Cleanup(func() {
-		dynamicMu.Lock()
-		dynamicProducts = previousProducts
-		dynamicMu.Unlock()
-	})
+func TestCrossPlatformCoverageMCPDevMCPEndpointFollowsGatewayBaseURL(t *testing.T) {
+	t.Setenv("DINGTALK_MCPDEV_MCP_URL", "")
 
-	ids := DirectRuntimeProductIDs()
-	if !ids["pat"] {
-		t.Fatalf("DirectRuntimeProductIDs() missing default pat product: %#v", ids)
+	got := mcpdevMCPEndpoint()
+	if want := defaultPATGatewayBaseURL() + mcpdevServerPath; got != want {
+		t.Fatalf("mcpdevMCPEndpoint() = %q, want %q", got, want)
+	}
+	if !strings.HasPrefix(got, "https://") {
+		t.Fatalf("mcpdevMCPEndpoint() = %q, want an https gateway URL", got)
 	}
 }
 
-func TestDirectRuntimeEndpoint_DefaultPATFallbackWhenRegistryMissing(t *testing.T) {
-	withCleanDynamicRegistry(t)
-	assertEndpoint(t, "pat", "", defaultPATMCPEndpoint())
-}
+func TestCrossPlatformCoverageDirectRuntimeEndpointResolvesMCPDev(t *testing.T) {
+	t.Setenv("DINGTALK_MCPDEV_MCP_URL", "")
 
-func TestDirectRuntimeEndpoint_DefaultPATFallbackUsesConfiguredMCPBaseURL(t *testing.T) {
-	withCleanDynamicRegistry(t)
-
-	tmpDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmpDir, "mcp_url"), []byte("http://127.0.0.1:54321/base"), 0o600); err != nil {
-		t.Fatalf("WriteFile(mcp_url) error = %v", err)
-	}
-	t.Setenv("DWS_CONFIG_DIR", tmpDir)
-
-	assertEndpoint(t, "pat", "", "http://127.0.0.1:54321/base/server/"+defaultPATServerID)
-}
-
-func TestDirectRuntimeEndpoint_PATDiscoveryOverrideWinsOverBuiltInFallback(t *testing.T) {
-	withCleanDynamicRegistry(t)
-	customEndpoint := "https://example.com/server/custom-pat"
-	SetDynamicServers([]market.ServerDescriptor{
-		{
-			Endpoint: customEndpoint,
-			CLI: market.CLIOverlay{
-				ID:      "pat",
-				Command: "pat",
-			},
-		},
-	})
-	assertEndpoint(t, "pat", "", customEndpoint)
-}
-
-func TestNormalizeDirectRuntimeProductIDPreservesLegacyHiddenVendorRouting(t *testing.T) {
-	dynamicMu.Lock()
-	previousAliases := dynamicAliases
-	dynamicAliases = nil
-	dynamicMu.Unlock()
-	t.Cleanup(func() {
-		dynamicMu.Lock()
-		dynamicAliases = previousAliases
-		dynamicMu.Unlock()
-	})
-
-	cases := map[string]string{
-		"tb":                       "teambition",
-		"dingtalk-discovery":       "discovery",
-		"dingtalk-oa-plus":         "oa",
-		"dingtalk-ai-sincere-hire": "ai-sincere-hire",
-	}
-
-	for input, want := range cases {
-		if got := normalizeDirectRuntimeProductID(input); got != want {
-			t.Fatalf("normalizeDirectRuntimeProductID(%q) = %q, want %q", input, got, want)
+	for _, productID := range []string{mcpdevProductID, "  " + mcpdevProductID + "  "} {
+		got, ok := directRuntimeEndpoint(productID, "mcp_server_url_get")
+		if !ok {
+			t.Fatalf("directRuntimeEndpoint(%q) ok = false, want true", productID)
 		}
+		if want := mcpdevMCPEndpoint(); got != want {
+			t.Fatalf("directRuntimeEndpoint(%q) = %q, want %q", productID, got, want)
+		}
+	}
+}
+
+func TestCrossPlatformCoverageMCPDevEndpointEnvOverrideWins(t *testing.T) {
+	const override = "https://mcp-gw.example.test/server/custom"
+	t.Setenv("DINGTALK_MCPDEV_MCP_URL", override)
+
+	got, ok := directRuntimeEndpoint(mcpdevProductID, "mcp_server_url_get")
+	if !ok || got != override {
+		t.Fatalf("directRuntimeEndpoint(%q) = %q %v, want %q true", mcpdevProductID, got, ok, override)
 	}
 }

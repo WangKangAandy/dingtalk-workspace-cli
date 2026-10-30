@@ -22,92 +22,530 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"os/signal"
-	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	authpkg "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/auth"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cache"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/cli"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/compat"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/discovery"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/corecmd"
 	apperrors "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/errors"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/executor"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/generator"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/helpers"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/logging"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/market"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/output"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pat"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pipeline"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/pipeline/handlers"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/plugin"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/recovery"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/profilemetadata"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/shortcut/usage"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/transport"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/agentproduct"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/cmdutil"
-	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/config"
 	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/edition"
+	"github.com/DingTalk-Real-AI/dingtalk-workspace-cli/pkg/mcptypes"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
 type outputFileContextKey struct{}
 
-const recoveryEventStderrPrefix = "RECOVERY_EVENT_ID="
+var (
+	rootNormalizeProcessProfileArgs = normalizeProcessProfileArgs
+	rootExecuteCommand              = (*cobra.Command).ExecuteC
+	rootNewRootCommandWithEngine    = newProcessRootCommandWithEngine
+	rootRunPreParse                 = pipeline.RunPreParse
+	rootStopAllStdioClients         = StopAllStdioClients
+	rootLoadPlugins                 = loadPlugins
+	rootPluginLoadHadSideEffects    atomic.Bool
+	rootMkdirAll                    = os.MkdirAll
+	rootCreateTemp                  = os.CreateTemp
+	rootSyncFile                    = (*os.File).Sync
+	rootCloseFile                   = (*os.File).Close
+	// os.Rename replaces an existing non-directory target on every supported
+	// Go host; the Windows implementation uses MOVEFILE_REPLACE_EXISTING. Keep
+	// the temporary file beside the target so publication stays on one volume.
+	rootRenameFile                  = os.Rename
+	rootRemoveFile                  = os.Remove
+	rootPluginInjectConfigEnv       = (*plugin.Loader).InjectPluginConfigEnv
+	rootPluginLoadUser              = (*plugin.Loader).LoadUser
+	rootPluginLoadDev               = (*plugin.Loader).LoadDev
+	rootPluginDescriptors           = (*plugin.Plugin).ToServerDescriptors
+	rootPluginStdioClients          = (*plugin.Plugin).StdioClients
+	rootRegisterPluginHTTPServer    = registerPluginHTTPServer
+	rootPluginStdioDescriptor       = stdioServerDescriptorFromManifest
+	rootRegisterResolvedStdioServer = registerResolvedStdioServer
+	rootPluginLoadHooks             = (*plugin.Plugin).LoadHooks
+	rootPluginSyncSkills            = plugin.SyncSkills
+	rootAuthLoadTokenData           = authpkg.LoadTokenData
+	rootPluginResolveIdentity       = profilemetadata.ResolveReadOnly
+	rootNewCommandRunnerWithFlags   = newCommandRunnerWithFlags
+	rootEmitResult                  = output.EmitResult
+	rootInstallProcessSignalContext = installProcessSignalContext
+)
 
 // Execute runs the root command and returns the process exit code.
-func Execute() (exitCode int) {
+func Execute() int {
+	exitCode, _, _ := ExecuteWithTelemetry()
+	return exitCode
+}
+
+// ExecuteWithTelemetry runs the root command and additionally returns a
+// privacy-safe command path and error summary for the official CLI entrypoint.
+func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage string) {
+	commandPath = "dws"
+	var (
+		root        *cobra.Command
+		executed    *cobra.Command
+		resultStore *output.ResultStore
+	)
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "Error: internal panic: %v\n", r)
-			exitCode = 5
+			errorMessage = "internal panic"
+			target := executed
+			if target == nil && root != nil {
+				if found, _, err := root.Find(os.Args[1:]); err == nil {
+					target = found
+				}
+			}
+			if target != nil {
+				commandPath = telemetryCommandPath(target)
+			}
+			if code, attempted, _, _ := output.StoredEmissionState(resultStore); attempted {
+				exitCode = code
+				if target != nil {
+					fmt.Fprintf(target.ErrOrStderr(), "Warning: command panicked after result emission attempt: %v\n", r)
+				}
+			} else if target != nil && output.UsesUnifiedResult(target) {
+				info := &output.ErrorInfo{Type: "internal", ExitCode: 5, Message: fmt.Sprintf("internal panic: %v", r)}
+				if code, err := output.EmitResult(target, output.Failure(info)); err == nil {
+					exitCode = code
+				} else {
+					fmt.Fprintf(os.Stderr, "Error: internal panic: %v\n", r)
+					exitCode = 5
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: internal panic: %v\n", r)
+				exitCode = 5
+			}
+			if executed == nil {
+				executed = target
+			}
+		}
+		CloseFileLogger()
+		if executed != nil {
+			if err := closeOutputSink(executed); err != nil {
+				errorMessage = telemetryErrorSummary(err)
+				if code, handled, emitErr := emitOutputPublicationFailure(executed, err); handled && emitErr == nil {
+					exitCode = code
+				} else {
+					exitCode = apperrors.ExitCode(err)
+					fmt.Fprintf(os.Stderr, "Warning: close output sink: %v\n", err)
+					if emitErr != nil {
+						fmt.Fprintf(os.Stderr, "Warning: emit output publication failure: %v\n", emitErr)
+					}
+				}
+			}
 		}
 	}()
+	restoreArgs := rootNormalizeProcessProfileArgs()
+	defer restoreArgs()
+
+	// Validate MCP Agent metadata before constructing the command tree.
+	// Construction may invoke edition registration/static-server hooks and load
+	// plugin PreParse handlers, so PersistentPreRunE alone is too late for the
+	// process entry point. Retain this exact pair for the eventual invocation.
+	agentMetadata := readAgentMetadataSnapshot()
+	if err := agentMetadata.validationError(); err != nil {
+		emitEarlyAgentMetadataValidationError(err, os.Args[1:])
+		errorMessage = telemetryErrorSummary(err)
+		exitCode = apperrors.ExitCode(err)
+		return
+	}
 
 	timing := NewTimingCollector()
 	defer func() {
-		StopAllStdioClients() // Ensure child processes are terminated on exit
+		cleanupStart := time.Now()
+		rootStopAllStdioClients() // Ensure child processes are terminated on exit
+		CloseAuditSink()          // Drain async audit forwards on all exit paths,
+		// including command errors where Cobra skips PersistentPostRunE.
+		timing.Record("business_cleanup", time.Since(cleanupStart))
 		timing.PrintIfEnabled()
 		timing.WriteReportIfEnabled(RawVersion(), SanitizeCommand(os.Args))
 	}()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
 	// Attach timing collector to context for use by child components
-	ctx = WithTimingCollector(ctx, timing)
+	ctx := WithTimingCollector(context.Background(), timing)
+	ctx = context.WithValue(ctx, versionCheckArgsKey{}, append([]string(nil), os.Args[1:]...))
+	ctx = context.WithValue(ctx, authStatusProcessStartupKey{}, true)
+	ctx = contextWithAgentMetadataSnapshot(ctx, agentMetadata)
+	ctx, resultStore = output.WithResultStore(ctx)
+	var signalState *processSignalState
+	var stopSignals func()
+	ctx, signalState, stopSignals = rootInstallProcessSignalContext(ctx, resultStore)
+	defer stopSignals()
 
 	initStart := time.Now()
-	recovery.ResetRuntimeState()
 	engine := newPipelineEngine()
-	root := NewRootCommandWithEngine(ctx, engine)
+	root = rootNewRootCommandWithEngine(ctx, engine)
+	commandPath = telemetryCommandPath(root)
 	timing.Record("cmd_init", time.Since(initStart))
 
 	// Run PreParse handlers on raw argv before Cobra parses flags.
 	// This corrects model-generated errors like --userId → --user-id
 	// and --limit100 → --limit 100.
-	pipeline.RunPreParse(root, engine)
+	preParseStart := time.Now()
+	preParseErr := rootRunPreParse(root, engine)
+	timing.Record("preparse", time.Since(preParseStart))
+	if err := preParseErr; err != nil {
+		err = newPreParseValidationError(err)
+		if interrupted, _ := signalState.Outcome(); interrupted != nil {
+			err = interrupted
+		}
+		notice := unknownInvocationNotice(root, err)
+		if target, _, findErr := root.Find(os.Args[1:]); findErr == nil && target != nil && output.UsesUnifiedResult(target) {
+			code, emitErr := emitFailureWithVersionNotice(target, err, notice)
+			if emitErr == nil {
+				errorMessage = telemetryErrorSummary(err)
+				exitCode = code
+				return
+			}
+		}
+		_ = printExecutionError(root, os.Stdout, os.Stderr, err, notice)
+		errorMessage = telemetryErrorSummary(err)
+		exitCode = apperrors.ExitCode(err)
+		return
+	}
+	commandPath = telemetryCommandPathForArgs(root, os.Args[1:])
 
-	executed, err := root.ExecuteC()
+	var err error
+	executeStart := time.Now()
+	executed, err = rootExecuteCommand(root)
+	timing.Record("command_execute", time.Since(executeStart))
+	if executed != nil {
+		commandPath = telemetryCommandPath(executed)
+	}
+	// PersistentPostRunE normally commits or aborts the transactional output
+	// sink. Finalize once more at the process boundary so custom execution
+	// seams, embedding callers, or future hook changes cannot leave publication
+	// errors to a defer that runs after the process exit code is fixed.
+	if executed != nil {
+		if err == nil {
+			if closeErr := closeOutputSink(executed); closeErr != nil {
+				err = closeErr
+			}
+		} else if abortErr := abortOutputSink(executed); abortErr != nil {
+			fmt.Fprintf(executed.ErrOrStderr(), "Warning: abort output sink after command failure: %v\n", abortErr)
+		}
+	}
+	interrupted, primaryCompletedBeforeSignal := signalState.Outcome()
+	if interrupted != nil && !primaryCompletedBeforeSignal {
+		if code, attempted, _, _ := output.StoredEmissionState(resultStore); attempted {
+			var publicationErr *outputPublicationError
+			if err != nil && stderrors.As(err, &publicationErr) {
+				// The successful result was written only to a transaction that did
+				// not publish. Let the error path replace it with one observable
+				// failure envelope on the restored original stream.
+			} else {
+				if executed == nil {
+					executed = root
+				}
+				fmt.Fprintf(executed.ErrOrStderr(), "Warning: process interrupted after result emission attempt: %v\n", interrupted)
+				// Once publication starts, its stored exit code is authoritative. A
+				// signal recorded just before or during publication must not turn a
+				// successfully emitted result into a contradictory 130/143 process
+				// status; likewise, a failed publication must retain its internal
+				// error code instead of being relabelled as cancellation.
+				errorMessage = telemetryErrorSummary(interrupted)
+				exitCode = code
+				return
+			}
+		}
+		var publicationErr *outputPublicationError
+		if err == nil || !stderrors.As(err, &publicationErr) {
+			err = interrupted.WithCancellationDetail(err)
+		}
+	}
 	if err != nil {
 		if executed == nil {
 			executed = root
+			commandPath = telemetryCommandPath(root)
+		}
+		if code, attempted, _, _ := output.StoredEmissionState(resultStore); attempted {
+			var publicationErr *outputPublicationError
+			if stderrors.As(err, &publicationErr) {
+				errorMessage = telemetryErrorSummary(publicationErr)
+				if failureCode, handled, emitErr := emitOutputPublicationFailure(executed, publicationErr); handled {
+					if emitErr == nil {
+						exitCode = failureCode
+						return
+					}
+					fmt.Fprintf(executed.ErrOrStderr(), "Warning: emit output publication failure: %v\n", emitErr)
+				}
+				exitCode = apperrors.ExitCode(publicationErr)
+				return
+			}
+			fmt.Fprintf(executed.ErrOrStderr(), "Warning: command hook failed after result emission: %v\n", err)
+			errorMessage = telemetryErrorSummary(err)
+			exitCode = code
+			return
+		}
+		var raw apperrors.RawStderrError
+		notice := unknownInvocationNotice(executed, err)
+		if output.UsesUnifiedResult(executed) && !stderrors.As(err, &raw) {
+			code, emitErr := emitFailureWithVersionNotice(executed, err, notice)
+			if emitErr == nil {
+				errorMessage = telemetryErrorSummary(err)
+				exitCode = code
+				return
+			}
+			err = apperrors.NewInternal("emit failure result: "+emitErr.Error(), apperrors.WithCause(emitErr))
 		}
 		if isUnknownCommandError(err) {
 			executed.SetOut(os.Stderr)
 			_ = executed.Help()
 			_, _ = fmt.Fprintln(os.Stderr)
 		}
-		_ = printExecutionError(executed, os.Stdout, os.Stderr, err)
-		if last := recovery.LatestCapture(); last != nil && last.EventID != "" {
-			_, _ = fmt.Fprintf(os.Stderr, "%s%s\n", recoveryEventStderrPrefix, last.EventID)
-		}
-		return apperrors.ExitCode(err)
+		_ = printExecutionError(executed, os.Stdout, os.Stderr, err, notice)
+		errorMessage = telemetryErrorSummary(err)
+		exitCode = apperrors.ExitCode(err)
+		return
 	}
-	return 0
+	if code, emitted := output.StoredExitCode(resultStore); emitted {
+		exitCode = code
+		return
+	}
+	return
+}
+
+func telemetryCommandPath(command *cobra.Command) string {
+	if command == nil {
+		return "dws"
+	}
+	path := strings.TrimSpace(command.CommandPath())
+	root := command.Root()
+	rootName := strings.TrimSpace(root.Name())
+	if path == rootName {
+		return rootName
+	}
+	if rootName != "" {
+		path = strings.TrimSpace(strings.TrimPrefix(path, rootName+" "))
+	}
+	return path
+}
+
+func telemetryCommandPathForArgs(root *cobra.Command, args []string) string {
+	if root == nil {
+		return "dws"
+	}
+	command, _, err := root.Find(args)
+	if err != nil || command == nil {
+		return telemetryCommandPath(root)
+	}
+	return telemetryCommandPath(command)
+}
+
+// emitEarlyAgentMetadataValidationError preserves each built-in command's
+// legacy-vs-unified output contract without running extension hooks. The
+// presentation-only tree contains reviewed open-source commands and flags but
+// deliberately omits edition registration, plugin loading, and visibility
+// hooks; callers therefore still fail before any external hook executes.
+func emitEarlyAgentMetadataValidationError(err error, args []string) {
+	format := processArgsFormat(args)
+	presentationRoot := newRootPresentationCommand()
+	_ = presentationRoot.PersistentFlags().Set("format", format)
+	if target, _, findErr := presentationRoot.Find(args); findErr == nil && target != nil && output.UsesUnifiedResult(target) {
+		target.SetOut(os.Stdout)
+		target.SetErr(os.Stderr)
+		result := output.FailureWithExitCode(errorInfoFromExecutionError(err), apperrors.ExitCode(err))
+		if _, emitErr := rootEmitResult(target, result); emitErr == nil {
+			return
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(format), "json") {
+		_ = apperrors.PrintJSON(os.Stderr, err)
+		return
+	}
+	_ = apperrors.PrintHumanAt(os.Stderr, err, apperrors.VerbosityNormal)
+}
+
+// processArgsRequestJSON preserves the CLI's machine-readable error contract
+// for validation that must occur before Cobra and its presentation flags exist.
+// The global format defaults to JSON; an explicit non-JSON format switches to
+// the human diagnostic path. Last occurrence wins, matching pflag semantics.
+func processArgsRequestJSON(args []string) bool {
+	return strings.EqualFold(strings.TrimSpace(processArgsFormat(args)), "json")
+}
+
+func processArgsFormat(args []string) string {
+	format := "json"
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--" {
+			break
+		}
+		if value, ok := strings.CutPrefix(arg, "--format="); ok {
+			format = value
+			continue
+		}
+		if value, ok := strings.CutPrefix(arg, "-f="); ok {
+			format = value
+			continue
+		}
+		if strings.HasPrefix(arg, "-f") && len(arg) > len("-f") {
+			format = strings.TrimPrefix(arg, "-f")
+			continue
+		}
+		if arg != "--format" && arg != "-f" {
+			continue
+		}
+		if index+1 >= len(args) {
+			format = ""
+			break
+		}
+		index++
+		format = args[index]
+	}
+	return format
+}
+
+// errorInfoFromExecutionError projects the repository error model into the unified
+// failure body. Exit code and category are derived from the same error value,
+// preventing the wire and process status from drifting apart.
+func errorInfoFromExecutionError(err error) *output.ErrorInfo {
+	exitCode := apperrors.ExitCode(err)
+	info := &output.ErrorInfo{
+		Type:     errorTypeForExitCode(exitCode),
+		ExitCode: exitCode,
+		Message:  err.Error(),
+	}
+	var interrupted *processInterruption
+	if stderrors.As(err, &interrupted) && interrupted != nil {
+		info.Type = "internal"
+		info.Subtype = interrupted.Subtype()
+		return info
+	}
+	if stderrors.Is(err, context.DeadlineExceeded) {
+		info.Subtype = "deadline_exceeded"
+	}
+	var cliErr *helpers.CLIError
+	if stderrors.As(err, &cliErr) && cliErr != nil {
+		info.UpstreamCode = cliErr.Code
+		if cliErr.ServerCode != "" {
+			info.UpstreamCode = cliErr.ServerCode
+		}
+		info.Hint = cliErr.Suggestion
+		info.Operation = cliErr.Operation
+		// Cause is an internal error chain, not a reviewed public diagnostic.
+		// Publish only explicitly authored message, hint and structured metadata.
+		if len(cliErr.Details) > 0 {
+			info.Details = cliErr.Details
+		}
+	}
+	var callErr *transport.CallError
+	if stderrors.As(err, &callErr) && callErr != nil {
+		info.HTTPStatus = callErr.HTTPStatus
+		info.RPCCode = callErr.RPCCode
+		info.Stage = string(callErr.Stage)
+		if callErr.RequestID != "" {
+			info.RequestID = callErr.RequestID
+		} else if callErr.TraceID != "" {
+			info.RequestID = callErr.TraceID
+		}
+	}
+	var typed *apperrors.Error
+	if !stderrors.As(err, &typed) || typed == nil {
+		return info
+	}
+	if typed.Category == apperrors.CategoryPartial {
+		// An error lacks the item-level data required by partial_failure.
+		// Callers must use output.Partial; fail closed consistently otherwise.
+		info.Type = string(apperrors.CategoryInternal)
+	} else {
+		info.Type = string(typed.Category)
+	}
+	info.Subtype = typed.Reason
+	if typed.Hint != "" {
+		info.Hint = typed.Hint
+	}
+	info.Actions = apperrors.RecoveryActions(err)
+	info.Retryable = typed.RetryableSet && typed.Retryable
+	info.RetryAfterSeconds = typed.RetryAfterSeconds
+	if typed.RPCCode != 0 {
+		info.RPCCode = typed.RPCCode
+	}
+	if typed.ServerDiag.TraceID != "" {
+		info.TraceID = typed.ServerDiag.TraceID
+	}
+	if typed.Operation != "" {
+		info.Operation = typed.Operation
+	}
+	info.ServerKey = typed.ServerKey
+	info.Origin = typed.Origin
+	if typed.FailureStage != "" {
+		info.Stage = typed.FailureStage
+	}
+	info.ExecutionStarted = typed.ExecutionStarted
+	if typed.NextRetryAt != nil {
+		info.NextRetryAt = typed.NextRetryAt.UTC().Format(time.RFC3339)
+	}
+	info.AvailableFlags = append([]string(nil), typed.AvailableFlags...)
+	info.SnapshotPath = typed.Snapshot
+	info.Details = typed.Details
+	if len(typed.RPCData) > 0 {
+		var rpcData any
+		if json.Unmarshal(typed.RPCData, &rpcData) == nil {
+			info.RPCData = rpcData
+		}
+	}
+	info.TechnicalDetail = typed.ServerDiag.TechnicalDetail
+	info.FriendlyHint, info.ActionURL = apperrors.ServerGuidance(typed.ServerDiag)
+	// Do not reintroduce internal causes through the typed-error projection.
+	if typed.ServerDiag.ServerErrorCode != "" {
+		info.UpstreamCode = typed.ServerDiag.ServerErrorCode
+	}
+	return info
+}
+
+func errorTypeForExitCode(code int) string {
+	switch code {
+	case 1:
+		return "api"
+	case 2:
+		return "auth"
+	case 3:
+		return "validation"
+	case 4:
+		return "permission"
+	case 6:
+		return "discovery"
+	default:
+		return "internal"
+	}
+}
+
+// newPreParseValidationError keeps pipeline handler identity in internal logs
+// while exposing only the underlying parameter-domain error to CLI users.
+func newPreParseValidationError(err error) error {
+	// Only the engine's direct diagnostic shell is transparent. Never search
+	// through an authoritative error to find and strip a deeper HandlerError.
+	userErr := err
+	for {
+		handlerErr, ok := userErr.(*pipeline.HandlerError)
+		if !ok || handlerErr.Unwrap() == nil {
+			break
+		}
+		userErr = handlerErr.Unwrap()
+	}
+	return apperrors.NormalizeValidation(
+		userErr,
+		apperrors.WithReason("parameter_conflict"),
+		apperrors.WithHint("Remove the duplicate alias/canonical spelling and pass the parameter exactly once."),
+	)
 }
 
 func isUnknownCommandError(err error) bool {
@@ -115,8 +553,56 @@ func isUnknownCommandError(err error) bool {
 }
 
 // flagErrorWithSuggestions provides helpful suggestions for common flag mistakes.
+//
+// 所有 flag 解析错误都会在 message 末尾追加 "See '<CommandPath> --help' for usage."，
+// 与 docker / kubectl / gh / wukong CLI 的 UX 一致，方便用户/agent 复制完整命令查 help。
+// 装在 root 的 FlagErrorFunc 通过 cobra 的 parent fallback 机制覆盖全命令树
+// （cobra.Command.FlagErrorFunc 沿 c.parent 递归向上查找）。
 func flagErrorWithSuggestions(cmd *cobra.Command, err error) error {
+	// Explicitly classified and interrupted errors are authoritative even when
+	// their text happens to resemble a known flag typo. Suggestions may enrich
+	// raw parser failures only; they must never relabel an existing contract.
+	if apperrors.PreserveClassification(err) {
+		return err
+	}
 	errMsg := err.Error()
+	// 尾部 hint：换行 + See '...' for usage.
+	// JSON 输出时 \n 会被序列化为字面 \n，文本输出时换行；
+	// 无论哪种格式，子串 "--help' for usage." 都可被检索到。
+	tail := fmt.Sprintf("\nSee '%s --help' for usage.", cmd.CommandPath())
+	msgWithTail := errMsg + tail
+	if flag, ok := unknownFlagName(errMsg); ok && flag == "from" {
+		switch cmd.CommandPath() {
+		case "dws chat +search-msg", "dws chat +chat-messages":
+			return apperrors.MarkLocalRecovery(apperrors.NewValidation(
+				msgWithTail,
+				apperrors.WithHint("--from 在消息查询中含义不明确：按发送者过滤请使用 --sender <姓名|userId|openDingTalkId>；指定时间起点请使用 --start <RFC3339>"),
+				apperrors.WithReason("ambiguous_flag"),
+				apperrors.WithCause(err),
+				apperrors.WithActions(
+					"Use --sender <姓名|userId|openDingTalkId> to filter by sender",
+					"Use --start <RFC3339> together with --end <RFC3339> to set a time range",
+				),
+				apperrors.WithAvailableFlags(cmdutil.VisibleFlagNames(cmd)...),
+			))
+		}
+	}
+	if flag, protection, ok := reviewedFlagProtection(cmd, errMsg); ok {
+		hint := fmt.Sprintf("Parameter --%s is blocked from automatic normalization on %q; choose an explicit flag from --help.", flag, cmd.CommandPath())
+		reason := "blocked_flag"
+		if protection == pipeline.FlagProtectionAmbiguous {
+			hint = fmt.Sprintf("Parameter --%s is ambiguous on %q and cannot be normalized safely; choose the intended explicit flag from --help.", flag, cmd.CommandPath())
+			reason = "ambiguous_flag"
+		}
+		return apperrors.MarkLocalRecovery(apperrors.NewValidation(
+			msgWithTail,
+			apperrors.WithHint(hint),
+			apperrors.WithReason(reason),
+			apperrors.WithCause(err),
+			apperrors.WithActions(fmt.Sprintf("Run '%s --help' for valid flags", cmd.CommandPath())),
+			apperrors.WithAvailableFlags(cmdutil.VisibleFlagNames(cmd)...),
+		))
+	}
 
 	// Common flag aliases and suggestions
 	suggestions := map[string]string{
@@ -134,47 +620,99 @@ func flagErrorWithSuggestions(cmd *cobra.Command, err error) error {
 
 	for flag, suggestion := range suggestions {
 		if strings.Contains(errMsg, "unknown flag: "+flag) {
-			return apperrors.NewValidation(
-				errMsg,
+			return apperrors.MarkLocalRecovery(apperrors.NewValidation(
+				msgWithTail,
 				apperrors.WithHint(suggestion),
 				apperrors.WithReason("unknown_flag"),
 				apperrors.WithCause(err),
 				apperrors.WithActions(fmt.Sprintf("Run '%s --help' for valid flags", cmd.CommandPath())),
 				apperrors.WithAvailableFlags(cmdutil.VisibleFlagNames(cmd)...),
-			)
+			))
 		}
 	}
 
 	if strings.Contains(errMsg, "unknown flag:") {
 		fix := cmdutil.SuggestFlagFix(cmd, err)
 		if fix.Suggestion != "" {
-			return apperrors.NewValidation(
-				errMsg,
+			result := apperrors.NewValidation(
+				msgWithTail,
 				apperrors.WithHint(fix.Suggestion),
 				apperrors.WithReason("unknown_flag"),
 				apperrors.WithCause(err),
 				apperrors.WithActions(fmt.Sprintf("Run '%s --help' for valid flags", cmd.CommandPath())),
 				apperrors.WithAvailableFlags(cmdutil.VisibleFlagNames(cmd)...),
 			)
+			if fix.HasCorrection {
+				return apperrors.MarkLocalRecovery(result)
+			}
+			return result
 		}
 	}
 
-	return err
+	// Fallback：未命中已知别名 / SuggestFlagFix 未给建议的 flag 解析错误
+	// （missing required / ambiguous / unknown shorthand 等），仍包尾部 hint，
+	// 行为对齐 wukong / docker / kubectl。
+	return apperrors.NormalizeValidation(
+		fmt.Errorf("%w%s", err, tail),
+		apperrors.WithReason("invalid_flag"),
+	)
 }
 
-func printExecutionError(root *cobra.Command, stdout, stderr io.Writer, err error) error {
+func reviewedFlagProtection(cmd *cobra.Command, errMsg string) (string, pipeline.FlagProtection, bool) {
+	if cmd == nil {
+		return "", "", false
+	}
+	flag, ok := unknownFlagName(errMsg)
+	if !ok {
+		return "", "", false
+	}
+	entry, ok := cli.LookupParamAlias(cmd.CommandPath())
+	if !ok {
+		return "", "", false
+	}
+	morphed := cmdutil.Morph(flag)
+	if entry.IsBlocked(morphed) {
+		return flag, pipeline.FlagProtectionBlocked, true
+	}
+	if entry.IsAmbiguous(morphed) {
+		return flag, pipeline.FlagProtectionAmbiguous, true
+	}
+	return "", "", false
+}
+
+func unknownFlagName(errMsg string) (string, bool) {
+	const prefix = "unknown flag: --"
+	idx := strings.Index(errMsg, prefix)
+	if idx < 0 {
+		return "", false
+	}
+	flag := strings.TrimSpace(errMsg[idx+len(prefix):])
+	if i := strings.IndexAny(flag, " =\n\t"); i >= 0 {
+		flag = flag[:i]
+	}
+	return flag, flag != ""
+}
+
+func printExecutionError(root *cobra.Command, stdout, stderr io.Writer, err error, notices ...*versionNotices) error {
 	var raw apperrors.RawStderrError
 	if stderrors.As(err, &raw) {
 		_, writeErr := fmt.Fprintln(stderr, raw.RawStderr())
 		return writeErr
 	}
-	if writeIdentityAuthError(stderr, err) {
-		return nil
-	}
 	if wantsJSONErrors(root) {
+		if len(notices) > 0 && notices[0] != nil {
+			return apperrors.PrintJSONWithNotice(stderr, err, notices[0])
+		}
 		return apperrors.PrintJSON(stderr, err)
 	}
-	return apperrors.PrintHumanAt(stderr, err, resolveVerbosity(root))
+	if writeErr := apperrors.PrintHumanAt(stderr, err, resolveVerbosity(root)); writeErr != nil {
+		return writeErr
+	}
+	if len(notices) > 0 && notices[0] != nil {
+		_, writeErr := fmt.Fprintln(stderr, notices[0].Update.Message)
+		return writeErr
+	}
+	return nil
 }
 
 // resolveVerbosity derives the error verbosity level from the root command's flags.
@@ -217,9 +755,6 @@ func commandRequestsJSONErrors(cmd *cobra.Command) bool {
 		cmd.InheritedFlags(),
 		cmd.PersistentFlags(),
 	} {
-		if flags == nil {
-			continue
-		}
 		if flag := flags.Lookup("format"); flag != nil {
 			if value, err := flags.GetString("format"); err == nil && strings.EqualFold(strings.TrimSpace(value), "json") {
 				return true
@@ -242,291 +777,670 @@ func commandRequestsJSONErrors(cmd *cobra.Command) bool {
 // is propagated to background goroutines and the Cobra command tree so
 // that SIGINT/SIGTERM can cancel in-flight work.
 func NewRootCommand(ctx ...context.Context) *cobra.Command {
+	registerSchemaRuntimeDelivery()
 	var rootCtx context.Context
 	if len(ctx) > 0 && ctx[0] != nil {
 		rootCtx = ctx[0]
 	}
-	return NewRootCommandWithEngine(rootCtx, nil)
+	rootCtx, _ = output.WithResultStore(rootCtx)
+	return newRootCommandWithEngine(rootCtx, nil, true, false)
+}
+
+// NewSchemaSourceRootCommand constructs the distribution-owned command tree
+// used as the Schema assembly source root (RegisterSchemaSourceRoot →
+// ResolveSchemaBuild) and by command-surface policy. Installed plugins and
+// user-defined shortcuts must not change the reviewed Schema surface.
+// declarationOnly skips runtime profile selection, injectStaticServers and
+// helpers.InitDeps so Schema assembly cannot clobber a live process's profile,
+// ToolCaller or plugin endpoints.
+func NewSchemaSourceRootCommand(ctx ...context.Context) *cobra.Command {
+	var rootCtx context.Context
+	if len(ctx) > 0 && ctx[0] != nil {
+		rootCtx = ctx[0]
+	}
+	return newRootCommandWithEngine(rootCtx, nil, false, true)
 }
 
 // NewRootCommandWithEngine constructs the root CLI command with an
 // optional pipeline engine for input correction. When engine is nil,
 // no pipeline processing is applied.
 func NewRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) *cobra.Command {
+	return newRootCommandWithAssembly(rootCtx, engine, nil)
+}
+
+// newRootCommandWithAssembly mounts caller-owned additions before the framework
+// snapshots and prepares the final tree. The callback must not execute commands.
+func newRootCommandWithAssembly(rootCtx context.Context, engine *pipeline.Engine, assemble func(*cobra.Command)) *cobra.Command {
+	registerSchemaRuntimeDelivery()
+	rootCtx, _ = output.WithResultStore(rootCtx)
+	return newRootCommandWithMode(rootCtx, engine, true, false, false, assemble)
+}
+
+func newProcessRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) *cobra.Command {
+	registerSchemaRuntimeDelivery()
+	rootCtx, _ = output.WithResultStore(rootCtx)
+	return newRootCommandWithMode(rootCtx, engine, true, false, false)
+}
+
+func newRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine, loadRuntimeExtensions bool, declarationOnly bool) *cobra.Command {
+	return newRootCommandWithMode(rootCtx, engine, loadRuntimeExtensions, declarationOnly, false)
+}
+
+func newRootPresentationCommand() *cobra.Command {
+	return newRootCommandWithMode(context.Background(), nil, false, true, true)
+}
+
+func consumeCredentialInvocationFlags(root *cobra.Command, flags *GlobalFlags, invocationSeen *bool) {
+	if root == nil || flags == nil || invocationSeen == nil {
+		return
+	}
+
+	clientIDFlag := root.PersistentFlags().Lookup("client-id")
+	clientSecretFlag := root.PersistentFlags().Lookup("client-secret")
+	clientIDSet := clientIDFlag != nil && clientIDFlag.Changed
+	clientSecretSet := clientSecretFlag != nil && clientSecretFlag.Changed
+
+	clientID := ""
+	if clientIDSet {
+		clientID = flags.ClientID
+	}
+	clientSecret := ""
+	if clientSecretSet {
+		clientSecret = flags.ClientSecret
+	}
+
+	// Keep GlobalFlags scoped to this execution. A flag omitted from the current
+	// invocation must not retain the value pflag parsed for a previous one.
+	flags.ClientID = clientID
+	flags.ClientSecret = clientSecret
+	if clientIDSet || clientSecretSet {
+		authpkg.SetClientCredentials(clientID, clientSecret)
+	} else if *invocationSeen {
+		// Preserve a programmatically supplied runtime pair on the first execution,
+		// but never carry credentials installed by an earlier execution of this root.
+		authpkg.SetClientCredentials("", "")
+	}
+	*invocationSeen = true
+
+	// Changed is execution state in this reusable command tree, not a lifetime
+	// property. The next parse will set it again for flags actually supplied.
+	if clientIDFlag != nil {
+		clientIDFlag.Changed = false
+	}
+	if clientSecretFlag != nil {
+		clientSecretFlag.Changed = false
+	}
+}
+
+func discardCredentialInvocationFlags(root *cobra.Command, flags *GlobalFlags, invocationSeen bool) {
+	if flags != nil {
+		flags.ClientID = ""
+		flags.ClientSecret = ""
+	}
+	if root != nil {
+		if flag := root.PersistentFlags().Lookup("client-id"); flag != nil {
+			flag.Changed = false
+		}
+		if flag := root.PersistentFlags().Lookup("client-secret"); flag != nil {
+			flag.Changed = false
+		}
+	}
+	if invocationSeen {
+		authpkg.SetClientCredentials("", "")
+	}
+}
+
+func consumeRootVersionInvocationFlag(root *cobra.Command, requested *bool) {
+	if root == nil || requested == nil {
+		return
+	}
+	flag := root.Flags().Lookup("version")
+	*requested = flag != nil && flag.Changed && *requested
+	if flag != nil {
+		flag.Changed = false
+	}
+}
+
+func discardRootVersionInvocationFlag(root *cobra.Command, requested *bool) {
+	if requested != nil {
+		*requested = false
+	}
+	if root != nil {
+		if flag := root.Flags().Lookup("version"); flag != nil {
+			flag.Changed = false
+		}
+	}
+}
+
+func installInvocationExitHandlers(root *cobra.Command, flags *GlobalFlags, credentialInvocationSeen *bool, versionRequested *bool) {
+	if root == nil || credentialInvocationSeen == nil {
+		return
+	}
+	var delegatorScope *delegatorInvocation
+	if flags != nil {
+		delegatorScope = flags.delegatorInvocation
+	}
+	cleanup := func(current *cobra.Command) {
+		delegatorScope.clear()
+		if principal := current.Flags().Lookup("principal-user-id"); principal != nil {
+			_ = principal.Value.Set("")
+			principal.Changed = false
+		}
+		consumeDelegatorFlags(root)
+		discardCredentialInvocationFlags(root, flags, *credentialInvocationSeen)
+		discardRootVersionInvocationFlag(root, versionRequested)
+		if exchange, _, err := root.Find([]string{"auth", "exchange"}); err == nil {
+			resetAuthExchangeInvocationFlags(exchange)
+		}
+		for _, name := range []string{"exchange-prepare", "token-exchange"} {
+			if cmd, _, err := root.Find([]string{"auth", name}); err == nil {
+				resetAuthOIDCExchangeInvocationFlags(cmd)
+			}
+		}
+	}
+
+	// Cobra handles --help before PersistentPreRunE. Wrap the inherited help
+	// renderer once at the root so both flag-based and help-command paths clean
+	// partially parsed invocation state after rendering.
+	previousHelp := root.HelpFunc()
+	root.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		defer cleanup(cmd)
+		previousHelp(cmd, args)
+	})
+
+	// All prepared nodes share the framework's native validation policy. Use a
+	// single cleanup decorator across the tree; late default commands inherit it.
+	previousValidationError := root.ValidationErrorFunc()
+	validationError := func(current *cobra.Command, stage cobra.ValidationStage, err error) error {
+		// Classify before clearing flags needed for required-flag diagnostics.
+		defer cleanup(current)
+		return previousValidationError(current, stage, err)
+	}
+
+	// Install leaf handlers before the root handler so inherited handlers are
+	// captured without recursively wrapping an already wrapped parent.
+	var visit func(*cobra.Command)
+	visit = func(cmd *cobra.Command) {
+		for _, child := range cmd.Commands() {
+			visit(child)
+		}
+
+		cmd.SetValidationErrorFunc(validationError)
+		installDelegatorInvocationHooks(cmd, delegatorScope)
+
+		previousFlagError := cmd.FlagErrorFunc()
+		cmd.SetFlagErrorFunc(func(current *cobra.Command, err error) error {
+			cleanup(current)
+			return previousFlagError(current, err)
+		})
+	}
+	visit(root)
+}
+
+func newRootCommandWithMode(rootCtx context.Context, engine *pipeline.Engine, loadRuntimeExtensions bool, declarationOnly bool, presentationOnly bool, assemble ...func(*cobra.Command)) *cobra.Command {
 	if rootCtx == nil {
 		rootCtx = context.Background()
 	}
-	flags := &GlobalFlags{}
-	loader := cli.EnvironmentLoader{
-		LookupEnv:              os.LookupEnv,
-		CatalogBaseURLOverride: DiscoveryBaseURL(),
-		AuthTokenFunc: func(ctx context.Context) string {
-			return resolveRuntimeAuthToken(ctx, "")
-		},
-		LoggerFunc: FileLoggerInstance,
+	flags := &GlobalFlags{delegatorInvocation: &delegatorInvocation{}}
+	profileSelector := ""
+	if !declarationOnly {
+		profileSelector = preparseProfileFlag(os.Args[1:])
+		authpkg.SetRuntimeProfile(profileSelector)
 	}
-	runner := newCommandRunnerWithFlags(loader, flags)
+	runner := rootNewCommandRunnerWithFlags(flags)
+	patCaller := newRecordingToolCaller(newToolCallerAdapter(runner, flags))
+	if snapshot, ok := agentMetadataSnapshotFromContext(rootCtx); ok {
+		if runtime, ok := runner.(*runtimeRunner); ok {
+			runtime.agentMetadata = &snapshot
+		}
+	}
 
+	credentialInvocationSeen := false
+	rootVersionRequested := false
+	rootVersionShortCircuit := false
 	root := &cobra.Command{
 		Use:               "dws",
 		Short:             "DWS CLI",
+		Long:              `提示: 如果遇到能力缺失、命令报错、新功能未注册、或无法完成任务, 请先用 'dws upgrade' 升级到最新版本后再试. 钉钉 OpenAPI 和 dws CLI 持续迭代, 新能力和 bugfix 会先在新版本上线.`,
 		Args:              cobra.NoArgs,
 		SilenceErrors:     true,
 		SilenceUsage:      true,
 		DisableAutoGenTag: true,
-		Version:           Version(),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmd.Help()
-		},
-		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			// Apply OAuth credential overrides from CLI flags (highest priority).
-			if flags.ClientID != "" {
-				authpkg.SetClientID(flags.ClientID)
+		// Cobra's built-in --version path returns before PersistentPreRunE and
+		// cannot participate in reusable-root credential cleanup. Keep the same
+		// public flag and output in RunE so it crosses the normal invocation
+		// boundary instead.
+		Version: "",
+		RunE:    runRootHelp,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) (preRunErr error) {
+			flags.delegatorInvocation.clear()
+			defer func() {
+				if preRunErr != nil {
+					resetAuthExchangeInvocationFlags(cmd)
+					resetAuthProviderLoginInvocationFlags(cmd)
+					resetAuthOIDCExchangeInvocationFlags(cmd)
+				}
+			}()
+			rootVersionShortCircuit = false
+			if err := beginDelegatorInvocation(cmd); err != nil {
+				return err
 			}
-			if flags.ClientSecret != "" {
-				authpkg.SetClientSecret(flags.ClientSecret)
+			snapshot := cmd.Context().Value(delegatorContextKey{}).(delegatorSnapshot)
+			flags.delegatorInvocation.snapshot.Store(&snapshot)
+			// 多棵预创建树串行执行时，恢复当前树拥有的 helper caller。
+			// 显式注入的自定义 caller 仍由嵌入方拥有，不覆盖其装饰器或测试替身。
+			if current, ok := helpers.GetCaller().(recordingToolCaller); ok {
+				if owner, ok := current.inner.(*toolCallerAdapter); ok && owner.flags != nil && owner.flags.delegatorInvocation != nil {
+					helpers.InitDeps(patCaller)
+				}
 			}
-			syncActiveIdentityFromFlags(flags)
+			consumeRootVersionInvocationFlag(cmd.Root(), &rootVersionRequested)
+			if rootVersionRequested && cmd == cmd.Root() {
+				// Preserve Cobra's historical --version behavior: no metadata
+				// validation, edition hook, output lifecycle, or credential mutation.
+				// Only discard credential flags parsed for this non-operational call.
+				discardCredentialInvocationFlags(cmd.Root(), flags, false)
+				rootVersionShortCircuit = true
+				return nil
+			}
+
+			// Cobra command trees can be reused by embedding callers. pflag keeps a
+			// bound flag's value and Changed bit after ExecuteC returns, so consume
+			// credential flags at the execution boundary before any validation or
+			// hook can observe state left by a previous invocation.
+			if isAuthExchangeCommand(cmd) || isAuthProviderLoginCommand(cmd) || isAuthOIDCExchangeCommand(cmd) {
+				// 外部换票自行按请求解析应用参数；不能把这些参数写入全局应用。
+				// 清除前次调用安装的全局凭据；本次 flags 在 RunE 或早退时清理。
+				if credentialInvocationSeen {
+					authpkg.SetClientCredentials("", "")
+				}
+				credentialInvocationSeen = true
+			} else {
+				consumeCredentialInvocationFlags(cmd.Root(), flags, &credentialInvocationSeen)
+			}
+
+			// A public root may be reused by embedding callers through multiple
+			// ExecuteC invocations. Begin each invocation with an empty result
+			// lifecycle while retaining the store pointer observed by Execute's
+			// signal and exit-code handling. Declaration-only command trees do not
+			// install a store at construction time, so add one lazily when those
+			// trees are executed for compatibility and policy tests.
+			executionCtx, _ := output.WithResultStore(cmd.Context())
+			cmd.SetContext(executionCtx)
+			// WithResultStore above guarantees the reset precondition.
+			_ = output.ResetResultStore(executionCtx)
+			// Do not run Cobra's ValidateRequiredFlags/ValidateFlagGroups here:
+			// Cobra executes them between the leaf's PreRunE and RunE, and leaves
+			// rely on that order to normalize alias flags into required canonical
+			// flags (for example chat message download-media copies --msg-id into
+			// the required --message-id in PreRunE). Running them early fails the
+			// alias path before the leaf can normalize it. The transactional
+			// --output sink instead opens at Run entry (after Cobra's own
+			// validation), so validation failures still cannot strand a
+			// temporary file.
+			// Validate caller-provided identity and MCP metadata before command
+			// execution hooks or network activity. The process entry point additionally
+			// validates Agent metadata before command-tree construction; direct Cobra
+			// embedding retains this execution-boundary guard.
+			if _, err := parseAgentHost(os.Getenv(envDWSAgentHost)); err != nil {
+				return err
+			}
+			if _, err := parseAgentProduct(os.Getenv(agentproduct.EnvName)); err != nil {
+				return err
+			}
+			agentMetadata, cached := agentMetadataSnapshotFromContext(cmd.Context())
+			if !cached {
+				agentMetadata = readAgentMetadataSnapshot()
+			}
+			if err := agentMetadata.validationError(); err != nil {
+				return err
+			}
+			if runtime, ok := runner.(*runtimeRunner); ok {
+				// Retain the exact validated pair for this command execution so a
+				// concurrently mutating embedding environment cannot change what is
+				// later applied after edition and credential hooks.
+				runtime.agentMetadata = &agentMetadata
+			}
+			if shouldDetectNestedSkillLayout(cmd) {
+				if found, err := detectNestedMultiSkillLayout(); err == nil && found {
+					fmt.Fprintln(cmd.ErrOrStderr(), "⚠️  检测到旧升级器留下的嵌套 Skill；请运行 dws skill setup --mode multi 查看迁移计划并确认")
+				}
+			}
+
+			authpkg.SetRuntimeProfile(flags.Profile)
 
 			// Configure global slog level based on --debug / --verbose flags.
 			configureLogLevel(flags)
 
-			if err := configureOutputSink(cmd); err != nil {
-				return err
-			}
-			if fn := edition.Get().AfterPersistentPreRun; fn != nil {
-				return fn(cmd, args)
+			installOutputSinkRunBoundary(cmd)
+			// 输出初始化在业务 RunE 外层，也可能失败；清理必须包住整个执行入口。
+			cmd.RunE = wrapDelegatorInvocationHook(flags.delegatorInvocation, cmd.RunE, false)
+			if fn := edition.Get().AfterPersistentPreRun; fn != nil && !isAuthStatusReadOnlyCommand(cmd) {
+				if err := fn(cmd, args); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
-		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		PersistentPostRunE: func(cmd *cobra.Command, args []string) (err error) {
+			if rootVersionShortCircuit {
+				rootVersionShortCircuit = false
+				rootVersionRequested = false
+				return nil
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					warnAbortOutputSink(cmd)
+					panic(r)
+				}
+				if err != nil {
+					warnAbortOutputSink(cmd)
+				}
+			}()
+			_, emitted, emitErr := output.EmitStoredResult(cmd)
 			StopAllStdioClients()
-			CloseFileLogger()
-			return closeOutputSink(cmd)
+			CloseAuditSink()
+			if emitErr != nil {
+				return apperrors.NewInternal("emit command result: "+emitErr.Error(), apperrors.WithCause(emitErr))
+			}
+			if output.UsesUnifiedResult(cmd) && !emitted {
+				return apperrors.NewInternal("framework 2.0 command returned without a CommandResult")
+			}
+			if closeErr := closeOutputSink(cmd); closeErr != nil {
+				return closeErr
+			}
+			return nil
 		},
+	}
+	root.Flags().BoolVar(&rootVersionRequested, "version", false, "version for dws")
+	corecmd.ApplyGroupPolicy(root, corecmd.GroupPolicy{
+		Mode:        corecmd.GroupNavigationOnly,
+		Positionals: corecmd.PositionalsReject,
+		Recovery:    corecmd.RecoverySibling,
+	})
+	rootArgs := root.Args
+	root.Args = func(cmd *cobra.Command, args []string) error {
+		// Cobra's built-in --version returns before Args validation. Preserve
+		// that behavior only when the current parse explicitly selected the
+		// lifecycle-aware replacement; a prior failed writer must not bypass Args.
+		versionFlag := cmd.Flags().Lookup("version")
+		if versionFlag != nil && versionFlag.Changed && rootVersionRequested {
+			return nil
+		}
+		return rootArgs(cmd, args)
+	}
+	rootRunE := root.RunE
+	root.RunE = func(cmd *cobra.Command, args []string) error {
+		if rootVersionRequested {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s version %s\n", cmd.Name(), Version())
+			if err == nil {
+				// 保留版本字符串的 stdout 契约，检查结果走诊断通道。
+				_ = writeVersionCheck(cmd.ErrOrStderr(), commandVersionCheck(cmd, false))
+			}
+			return err
+		}
+		return rootRunE(cmd, args)
 	}
 
 	bindPersistentFlags(root, flags)
+	schemaCmd := cli.NewSchemaCommand()
+	mcpCmd := cli.NewMCPCommand()
+	// Wrap the caller so every MCP tool call's shape is recorded to the local
+	// usage log (privacy-preserving; see internal/shortcut/usage). Powers
+	// `dws shortcut stats` and future high-frequency shortcut distillation.
+	mcpCmd.AddCommand(
+		newMCPMarketGroup(patCaller),
+		newMCPURLGroup(patCaller),
+		newMCPPublishedGroup(patCaller, newAuthenticatedMCPPublishedTransportFactory(runner, flags)),
+	)
 
-	schemaCmd := newSchemaCommand(loader)
-	genSkillsCmd := newGenerateSkillsCommand()
-	genSkillsCmd.Hidden = true
-	mcpCmd := newMCPCommand(rootCtx, loader, runner, engine)
-	mcpCmd.Hidden = true
+	navigationGroup := func(command *cobra.Command) *cobra.Command {
+		corecmd.ApplyGroupPolicy(command, corecmd.GroupPolicy{
+			Mode:        corecmd.GroupNavigationOnly,
+			Positionals: corecmd.PositionalsReject,
+			Recovery:    corecmd.RecoverySibling,
+		})
+		return command
+	}
+	hybridGroup := func(command *cobra.Command) *cobra.Command {
+		corecmd.ApplyGroupPolicy(command, corecmd.GroupPolicy{
+			Mode:        corecmd.GroupHybrid,
+			Positionals: corecmd.PositionalsReject,
+			Recovery:    corecmd.RecoverySibling,
+		})
+		return command
+	}
 
 	utilityCommands := []*cobra.Command{
-		newAuthCommand(),
+		navigationGroup(newAuthCommand(patCaller)),
+		navigationGroup(newProfileCommand()),
 		newAPICommand(flags),
-		newSkillCommand(),
-		newCacheCommand(),
-		newConfigCommand(),
+		navigationGroup(newSkillCommand()),
+		hybridGroup(newCacheCommand()),
+		newCatalogCommand(),
+		navigationGroup(newConfigCommand()),
 		newDoctorCommand(),
+		hybridGroup(newRecoveryCommand()),
+		navigationGroup(newEventCommand(flags)),
+		navigationGroup(newAuditCommand()),
 		newCompletionCommand(root),
-		newRecoveryCommand(rootCtx, loader, flags),
 		newUpgradeCommand(),
 		newVersionCommand(),
 		newPluginCommand(),
+		navigationGroup(usage.NewShortcutCommand()),
 		schemaCmd,
-		genSkillsCmd,
-		mcpCmd,
+		navigationGroup(mcpCmd),
 	}
 	root.AddCommand(utilityCommands...)
 
-	root.AddCommand(newLegacyPublicCommands(rootCtx, runner)...)
-	root.AddCommand(newLegacyHiddenCommands(runner)...)
+	// The process argv is available before runtime extension initialization.
+	// Read-only status is local: do not let plugin user-context
+	// preloads or edition extension hooks acquire auth locks before its leaf.
+	readonlyStatusInvocation := false
+	processStartup, _ := rootCtx.Value(authStatusProcessStartupKey{}).(bool)
+	if loadRuntimeExtensions && processStartup {
+		if target, args, err := root.Find(os.Args[1:]); err == nil && target.Name() == "status" && target.Parent() != nil && target.Parent().Name() == "auth" {
+			// Parse with Cobra/pflag semantics (including explicit false, last
+			// occurrence wins and --) before choosing the startup path.
+			if authStatusReadOnlyRequested(target, args) {
+				readonlyStatusInvocation = true
+				loadRuntimeExtensions = false
+			}
+		}
+	}
 
-	// --- Plugin loading: runs AFTER legacy commands so that
-	// AppendDynamicServer adds plugin endpoints on top of Market
-	// endpoints (SetDynamicServers is called inside loadDynamicCommands).
-	pluginCmds := loadPlugins(engine, runner)
-	if len(pluginCmds) > 0 {
-		addPluginCommandsSafe(root, pluginCmds)
+	if declarationOnly || readonlyStatusInvocation {
+		// Schema / surface assembly: mount the reviewed tree only. Do not
+		// injectStaticServers or InitDeps — those mutate process globals and
+		// would clobber a live runtime's caller and plugin endpoints.
+		root.AddCommand(mountLegacyPublicCommands(runner, loadRuntimeExtensions)...)
+	} else {
+		root.AddCommand(newLegacyPublicCommands(runner, patCaller, loadRuntimeExtensions)...)
 	}
 
 	// PAT authorization commands (open-source core)
-	patCaller := newToolCallerAdapter(runner, flags)
 	pat.RegisterCommands(root, patCaller)
 
-	if fn := edition.Get().RegisterExtraCommands; fn != nil {
-		caller := newToolCallerAdapter(runner, flags)
-		fn(root, caller)
-		deduplicateCommands(root)
+	if !presentationOnly && !readonlyStatusInvocation {
+		if fn := edition.Get().RegisterExtraCommands; fn != nil {
+			caller := newToolCallerAdapter(runner, flags)
+			fn(root, caller)
+			deduplicateCommands(root)
+		}
 	}
-
-	hideNonDirectRuntimeCommands(root)
+	if loadRuntimeExtensions {
+		// Resolve plugins only after the complete distribution command tree is
+		// present, so endpoint and Cobra conflict checks see PAT and edition
+		// commands as well as the open-source base.
+		pluginStart := time.Now()
+		// plugin side effects are monotonic for the process lifetime
+		pluginCmds := rootLoadPlugins(root, engine, runner, profileSelector)
+		RecordNestedTiming(rootCtx, "plugin_discovery", time.Since(pluginStart))
+		if rootPluginLoadHadSideEffects.Load() || len(pluginCmds) > 0 {
+			// Plugin discovery changes process-global runtime state. Keep the
+			// parent process read-only with respect to persistent Schema cache;
+			// cache repair is delegated to the isolated declaration builder.
+			cli.MarkSchemaCacheRuntimeUncertain()
+			addPluginCommandsSafe(root, pluginCmds)
+		}
+	}
+	// Read-only status must not invoke edition visibility/server hooks either:
+	// hideNonDirectRuntimeCommands resolves visible products through
+	// VisibleProducts / StaticServers / SupplementServers, and nothing
+	// constrains those overlay hooks from touching credentials or acquiring
+	// the auth lock before the read-only leaf runs. The read-only tree loads
+	// no dynamic products, so the visibility pass has no effect on it.
+	if !presentationOnly && !readonlyStatusInvocation {
+		hideNonDirectRuntimeCommands(root)
+	}
+	for _, mount := range assemble {
+		if mount != nil {
+			mount(root)
+		}
+	}
 	configureRootHelp(root)
-	// Set custom flag error handler for better UX
+	// Set custom flag error handler for better UX.
 	root.SetFlagErrorFunc(flagErrorWithSuggestions)
+	installReviewedFlagProtectionHandlers(root)
+	if err := corecmd.PrepareCommandTree(root); err != nil {
+		panic(fmt.Sprintf("prepare command tree: %v", err))
+	}
+	installInvocationExitHandlers(root, flags, &credentialInvocationSeen, &rootVersionRequested)
 	root.SetContext(rootCtx)
 
 	return root
 }
 
-func newAuthCommand() *cobra.Command {
-	return buildAuthCommand()
+// installReviewedFlagProtectionHandlers makes reviewed blocked/ambiguous
+// parameters authoritative even when an older command subtree has installed a
+// local FlagErrorFunc. Commands without a reviewed guard keep their existing
+// handler or inherit the root handler as before.
+func installReviewedFlagProtectionHandlers(root *cobra.Command) {
+	if root == nil {
+		return
+	}
+	var visit func(*cobra.Command)
+	visit = func(cmd *cobra.Command) {
+		if entry, ok := cli.LookupParamAlias(cmd.CommandPath()); ok && (len(entry.Blocked) > 0 || len(entry.Ambiguous) > 0) {
+			previous := cmd.FlagErrorFunc()
+			cmd.SetFlagErrorFunc(func(current *cobra.Command, err error) error {
+				if _, _, guarded := reviewedFlagProtection(current, err.Error()); guarded {
+					return flagErrorWithSuggestions(current, err)
+				}
+				return previous(current, err)
+			})
+		}
+		for _, child := range cmd.Commands() {
+			visit(child)
+		}
+	}
+	visit(root)
+}
+
+func preparseProfileFlag(args []string) string {
+	profile, _, valid := preparseProfileSelection(args)
+	if !valid {
+		return ""
+	}
+	return profile
+}
+
+func preparseProfileSelection(args []string) (profile string, specified, valid bool) {
+	args, _ = normalizeProfileFlagArgs(args)
+	valid = true
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--profile":
+			specified = true
+			if i+1 >= len(args) || strings.HasPrefix(strings.TrimSpace(args[i+1]), "-") {
+				profile = ""
+				valid = false
+				continue
+			}
+			profile = strings.TrimSpace(args[i+1])
+			valid = profile != ""
+			i++
+		case strings.HasPrefix(arg, "--profile="):
+			specified = true
+			profile = strings.TrimSpace(strings.TrimPrefix(arg, "--profile="))
+			valid = profile != ""
+		}
+	}
+	return profile, specified, valid
+}
+
+func normalizeProcessProfileArgs() func() {
+	original := append([]string(nil), os.Args...)
+	if len(os.Args) > 1 {
+		if normalized, changed := normalizeProfileFlagArgs(os.Args[1:]); changed {
+			os.Args = append([]string{os.Args[0]}, normalized...)
+		}
+	}
+	return func() {
+		os.Args = original
+	}
+}
+
+func normalizeProfileFlagArgs(args []string) ([]string, bool) {
+	if len(args) == 0 {
+		return args, false
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		trimmed := strings.TrimSpace(arg)
+		switch {
+		case trimmed == "--profile":
+			out = append(out, arg)
+			if i+1 >= len(args) {
+				continue
+			}
+			value, next := collectProfileFlagValue(args[i+1], args, i+2)
+			out = append(out, value)
+			i = next - 1
+		case strings.HasPrefix(trimmed, "--profile="):
+			value, next := collectProfileFlagValue(strings.TrimPrefix(trimmed, "--profile="), args, i+1)
+			out = append(out, "--profile="+value)
+			i = next - 1
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out, argsChanged(args, out)
+}
+
+func collectProfileFlagValue(first string, args []string, next int) (string, int) {
+	parts := []string{strings.TrimSpace(first)}
+	for len(parts) > 0 && strings.HasSuffix(strings.TrimSpace(parts[len(parts)-1]), ",") && next < len(args) {
+		candidate := strings.TrimSpace(args[next])
+		if candidate == "" || strings.HasPrefix(candidate, "-") {
+			break
+		}
+		parts = append(parts, candidate)
+		next++
+	}
+	return strings.Join(parts, ""), next
+}
+
+func argsChanged(before, after []string) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func newAuthCommand(patCaller edition.ToolCaller) *cobra.Command {
+	return buildAuthCommand(patCaller)
 }
 
 func newSkillCommand() *cobra.Command {
 	return buildSkillCommand()
-}
-
-func newCacheCommand() *cobra.Command {
-	cacheCmd := newPlaceholderParent("cache", "缓存管理")
-
-	statusCmd := &cobra.Command{
-		Use:   "status",
-		Short: "查看缓存状态",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			jsonOut, err := cmd.Flags().GetBool("json")
-			if err != nil {
-				return apperrors.NewInternal("failed to read cache status flags")
-			}
-
-			store := cacheStoreFromEnv()
-			files, bytes, err := cacheDirectoryStats(store.Root)
-			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to read cache status: %v", err))
-			}
-
-			// Enumerate per-server tools cache entries.
-			partition := config.DefaultPartition
-			entries, _ := store.ListToolsCacheEntries(partition)
-
-			payload := map[string]any{
-				"kind":       "cache_status",
-				"cache_root": store.Root,
-				"files":      files,
-				"bytes":      bytes,
-			}
-			if len(entries) > 0 {
-				toolEntries := make([]map[string]any, 0, len(entries))
-				for _, e := range entries {
-					toolEntries = append(toolEntries, map[string]any{
-						"server_key":    e.ServerKey,
-						"freshness":     string(e.Freshness),
-						"saved_at":      e.SavedAt.Format(time.RFC3339),
-						"tool_count":    e.ToolCount,
-						"ttl_remaining": e.TTLRemaining,
-					})
-				}
-				payload["tools"] = toolEntries
-			}
-
-			if jsonOut {
-				return output.WriteJSON(cmd.OutOrStdout(), payload)
-			}
-
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "缓存目录: %s\n文件数:   %d   大小: %d 字节\n", store.Root, files, bytes)
-			if len(entries) > 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\n工具缓存:")
-				for _, e := range entries {
-					age := ""
-					if !e.SavedAt.IsZero() {
-						dur := time.Since(e.SavedAt).Truncate(time.Minute)
-						age = fmt.Sprintf("，%s 前保存", dur)
-					}
-					ttl := ""
-					if e.TTLRemaining != "" {
-						ttl = fmt.Sprintf("，剩余 TTL %s", e.TTLRemaining)
-					}
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s (%s%s，%d 个工具%s)\n",
-						e.ServerKey, string(e.Freshness), age, e.ToolCount, ttl)
-				}
-			}
-			return nil
-		},
-	}
-	statusCmd.Flags().Bool("json", false, "Emit cache status as JSON")
-
-	refreshCmd := &cobra.Command{
-		Use:               "refresh",
-		Short:             "强制刷新工具缓存",
-		DisableAutoGenTag: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			product, err := cmd.Flags().GetString("product")
-			if err != nil {
-				return apperrors.NewInternal("failed to read cache refresh flags")
-			}
-
-			store := cacheStoreFromEnv()
-			transportClient := transport.NewClient(nil)
-			transportClient.AuthToken = resolveRuntimeAuthToken(cmd.Context(), "")
-			// Market client here is only a fallback for Detail API calls inside
-			// DiscoverAllRuntime; the primary server-list fetch below goes
-			// through fetchRegistryServers so edition DiscoveryURL wins.
-			service := discovery.NewService(
-				market.NewClient(DiscoveryBaseURL(), nil),
-				transportClient,
-				store,
-			)
-
-			resp, err := fetchRegistryServers(cmd.Context(), ipv4HTTPClient(config.HTTPTimeout))
-			if err != nil {
-				return apperrors.NewDiscovery(fmt.Sprintf("cache refresh: fetch server list failed: %v", err))
-			}
-			servers := market.NormalizeServers(resp, "live_market")
-			_ = store.SaveRegistry(service.CachePartition(), cache.RegistrySnapshot{Servers: servers})
-
-			selected := selectServersForProduct(servers, product)
-			if strings.TrimSpace(product) != "" && len(selected) == 0 {
-				return apperrors.NewValidation(fmt.Sprintf("no market server matched product %q", product))
-			}
-			if len(selected) == 0 {
-				selected = servers
-			}
-
-			if err := clearRuntimeCacheForServers(store, service.CachePartition(), selected); err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to clear cache before refresh: %v", err))
-			}
-
-			refreshable := filterRefreshableServers(selected)
-			_, failures := service.DiscoverAllRuntime(cmd.Context(), refreshable)
-			_, err = fmt.Fprintf(
-				cmd.OutOrStdout(),
-				"[OK] 缓存刷新完成：已刷新 %d 个服务，失败 %d 个\n缓存目录: %s\n",
-				len(refreshable),
-				len(failures),
-				store.Root,
-			)
-			return err
-		},
-	}
-	refreshCmd.Flags().String("product", "", "Refresh only the selected canonical product")
-	_ = refreshCmd.Flags().MarkHidden("product")
-
-	cleanCmd := &cobra.Command{
-		Use:               "clean",
-		Short:             "清理缓存",
-		DisableAutoGenTag: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			staleOnly, err := cmd.Flags().GetBool("stale")
-			if err != nil {
-				return apperrors.NewInternal("failed to read cache clean stale flag")
-			}
-			product, err := cmd.Flags().GetString("product")
-			if err != nil {
-				return apperrors.NewInternal("failed to read cache clean product flag")
-			}
-
-			store := cacheStoreFromEnv()
-			removed, err := cleanCacheFiles(store.Root, product, staleOnly)
-			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to clean cache: %v", err))
-			}
-			_, err = fmt.Fprintf(
-				cmd.OutOrStdout(),
-				"[OK] 缓存清理完成：已删除 %d 个文件\n",
-				removed,
-			)
-			return err
-		},
-	}
-	cleanCmd.Flags().Bool("stale", false, "Only remove stale cache entries")
-	cleanCmd.Flags().String("product", "", "Clean only the selected canonical product")
-	cleanCmd.Hidden = true
-
-	cacheCmd.AddCommand(statusCmd, refreshCmd, cleanCmd)
-	return cacheCmd
 }
 
 func newVersionCommand() *cobra.Command {
@@ -551,14 +1465,19 @@ func newVersionCommand() *cobra.Command {
 			gc := GitCommit()
 			goVer := "1.24+"
 
-			arch := "MCP Dynamic Aggregation"
+			arch := "MCP Static Endpoint Mode"
+			check := commandVersionCheck(cmd, false)
 
 			if wantJSON {
 				payload := map[string]any{
-					"version":      ver,
-					"edition":      editionName,
-					"architecture": arch,
-					"go":           goVer,
+					"version":       ver,
+					"edition":       editionName,
+					"architecture":  arch,
+					"go":            goVer,
+					"version_check": check,
+				}
+				if notice := noticeForVersion(check, false); notice != nil {
+					payload["_notice"] = notice
 				}
 				if bt != "unknown" {
 					payload["build"] = bt
@@ -580,124 +1499,19 @@ func newVersionCommand() *cobra.Command {
 			}
 			fmt.Fprintf(w, "%-16s%s\n", "Architecture:", arch)
 			fmt.Fprintf(w, "%-16s%s\n", "Go:", goVer)
+			_ = writeVersionCheck(cmd.ErrOrStderr(), check)
 			return nil
 		},
 	}
 }
 
-func newSchemaCommand(loader cli.CatalogLoader) *cobra.Command {
-	return cli.NewSchemaCommand(loader)
-}
-
-func newGenerateSkillsCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:               "generate-skills",
-		Short:             "Generate agent skills from canonical metadata",
-		DisableAutoGenTag: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			source, err := cmd.Flags().GetString("source")
-			if err != nil {
-				return apperrors.NewInternal("failed to read generate-skills source flag")
-			}
-			outputRoot, err := cmd.Flags().GetString("output-root")
-			if err != nil {
-				return apperrors.NewInternal("failed to read generate-skills output-root flag")
-			}
-			withDocs, err := cmd.Flags().GetBool("with-docs")
-			if err != nil {
-				return apperrors.NewInternal("failed to read generate-skills with-docs flag")
-			}
-			fixture, err := cmd.Flags().GetString("fixture")
-			if err != nil {
-				return apperrors.NewInternal("failed to read generate-skills fixture flag")
-			}
-			snapshot, err := cmd.Flags().GetString("snapshot")
-			if err != nil {
-				return apperrors.NewInternal("failed to read generate-skills snapshot flag")
-			}
-			catalogPath := fixture
-			if strings.EqualFold(strings.TrimSpace(source), string(generator.CatalogSourceSnapshot)) {
-				catalogPath = snapshot
-			}
-			for flagName, raw := range map[string]string{
-				"--output-root": outputRoot,
-				"--fixture":     fixture,
-				"--snapshot":    snapshot,
-			} {
-				if err := validateOptionalPath(flagName, raw); err != nil {
-					return err
-				}
-			}
-
-			catalog, err := generator.LoadCatalogWithSource(cmd.Context(), source, catalogPath)
-			if err != nil {
-				return apperrors.NewDiscovery(fmt.Sprintf("failed to load canonical catalog: %v", err))
-			}
-			artifacts, err := generator.Generate(catalog)
-			if err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to generate skill artifacts: %v", err))
-			}
-
-			if withDocs {
-				if err := generator.WriteArtifacts(outputRoot, artifacts); err != nil {
-					return apperrors.NewInternal(fmt.Sprintf("failed to write generated artifacts: %v", err))
-				}
-				_, err = fmt.Fprintf(cmd.OutOrStdout(), "generated %d artifact(s) in %s\n", len(artifacts), outputRoot)
-				return err
-			}
-
-			targets := make([]generator.Artifact, 0)
-			for _, artifact := range artifacts {
-				if !strings.HasPrefix(artifact.Path, "skills/") {
-					continue
-				}
-				targets = append(targets, artifact)
-			}
-			if len(targets) == 0 {
-				return apperrors.NewInternal("no generated skill artifacts were produced")
-			}
-			if err := generator.WriteArtifacts(outputRoot, targets); err != nil {
-				return apperrors.NewInternal(fmt.Sprintf("failed to write generated skills: %v", err))
-			}
-
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "generated %d skill artifact(s) in %s\n", len(targets), outputRoot)
-			return err
-		},
-	}
-	cmd.Flags().String("output-root", ".", "Directory root for generated artifacts")
-	cmd.Flags().Bool("with-docs", true, "Write docs/schema artifacts in addition to skills")
-	cmd.Flags().String("source", string(generator.CatalogSourceFixture), "Catalog source for skill generation: fixture, env, or snapshot")
-	cmd.Flags().String("fixture", "", "Optional path to a catalog fixture; used by --source fixture")
-	cmd.Flags().String("snapshot", "", "Optional path to a catalog snapshot; used by --source snapshot")
-	return cmd
-}
-
-func newMCPCommand(ctx context.Context, loader cli.CatalogLoader, runner executor.Runner, engine *pipeline.Engine) *cobra.Command {
-	return cli.NewMCPCommand(ctx, loader, runner, engine)
-}
-
 // hideNonDirectRuntimeCommands marks top-level product commands as hidden
-// unless they correspond to a product discovered via dynamic server discovery
-// or listed in the edition's VisibleProducts hook.
-// Public utility commands (auth, cache, completion, version) are always kept
-// visible; explicitly hidden commands stay hidden.
+// unless they correspond to a static endpoint product or an edition-visible
+// compatibility command.
+// Public utility commands are always kept visible; explicitly hidden commands
+// stay hidden.
 func hideNonDirectRuntimeCommands(root *cobra.Command) {
 	allowedProducts := resolveVisibleProducts()
-	staticCommands := map[string]bool{
-		"auth":       true,
-		"api":        true,
-		"cache":      true,
-		"config":     true,
-		"doctor":     true,
-		"completion": true,
-		"skill":      true,
-		"plugin":     true,
-		"version":    true,
-		"help":       true,
-		"recovery":   true,
-		"schema":     true,
-		"mcp":        true,
-	}
 	for _, cmd := range root.Commands() {
 		name := cmd.Name()
 		if cmd.Hidden {
@@ -713,15 +1527,43 @@ func hideNonDirectRuntimeCommands(root *cobra.Command) {
 	}
 }
 
+// builtinCommandNames is the shared base set of built-in command names. Both
+// staticCommands (the visibility allow-list used by
+// hideNonDirectRuntimeCommands) and reservedCommands (the plugin-override
+// blocklist) derive from this single set so they cannot drift apart.
+var builtinCommandNames = map[string]bool{
+	"aicard": true, "auth": true, "api": true, "audit": true, "cache": true, "config": true,
+	"doctor": true, "event": true, "completion": true, "skill": true,
+	"plugin": true, "profile": true, "recovery": true, "version": true, "help": true,
+	"schema": true, "mcp": true, "upgrade": true,
+}
+
+// commandNameSet returns a new set containing every name in base plus extras.
+func commandNameSet(base map[string]bool, extras ...string) map[string]bool {
+	set := make(map[string]bool, len(base)+len(extras))
+	for name := range base {
+		set[name] = true
+	}
+	for _, extra := range extras {
+		set[extra] = true
+	}
+	return set
+}
+
+// staticCommands is the set of built-in commands that stay visible even when
+// they are not backed by a static endpoint product. Asymmetry with
+// reservedCommands is intentional: dev/markdown/html stay visible but are not
+// plugin-reserved, while login/logout are plugin-reserved but are not static
+// top-level commands.
+var staticCommands = commandNameSet(builtinCommandNames, "dev", "markdown", "html")
+
 // reservedCommands is the set of built-in command names that plugins must
 // not override. This protects core CLI functionality from being hijacked
 // by a malicious or misconfigured plugin.
-var reservedCommands = map[string]bool{
-	"auth": true, "api": true, "login": true, "logout": true,
-	"plugin": true, "skill": true, "cache": true,
-	"config": true, "doctor": true, "completion": true,
-	"recovery": true, "upgrade": true, "version": true,
-	"schema": true, "mcp": true, "help": true,
+var reservedCommands = commandNameSet(builtinCommandNames, "login", "logout")
+
+var replaceablePluginFallbacks = map[string]bool{
+	"conference": true,
 }
 
 // addPluginCommandsSafe registers plugin commands with conflict detection.
@@ -729,7 +1571,8 @@ var reservedCommands = map[string]bool{
 // Rules:
 //   - Plugin vs reserved (auth/plugin/cache/...) → reject, warn
 //   - Plugin vs plugin (same name)               → reject later one, warn
-//   - Plugin vs Market dynamic command            → allow, plugin wins
+//   - Plugin vs hidden compatibility fallback     → allow, plugin wins
+//   - Plugin vs visible distribution command      → reject, warn
 func addPluginCommandsSafe(root *cobra.Command, pluginCmds []*cobra.Command) {
 	// Build index of existing commands before plugin registration.
 	existing := make(map[string]bool)
@@ -757,16 +1600,46 @@ func addPluginCommandsSafe(root *cobra.Command, pluginCmds []*cobra.Command) {
 		}
 		pluginSeen[name] = true
 
-		// Rule 3: plugin vs Market — plugin wins, remove the old one.
+		// An alias must not bypass the same protections applied to primary
+		// plugin command names or shadow another root command.
+		filteredAliases := make([]string, 0, len(cmd.Aliases))
+		for _, rawAlias := range cmd.Aliases {
+			alias := strings.TrimSpace(rawAlias)
+			if alias == "" || alias == name || reservedCommands[alias] ||
+				existing[alias] || pluginSeen[alias] {
+				if alias != "" {
+					slog.Warn("plugin: command alias conflicts with an existing command, skipping",
+						"command", name, "alias", alias)
+				}
+				continue
+			}
+			pluginSeen[alias] = true
+			filteredAliases = append(filteredAliases, alias)
+		}
+		cmd.Aliases = filteredAliases
+
+		// Rule 3: an installed plugin may replace a hidden compatibility
+		// fallback (for example conference), but never a visible distribution
+		// command that participates in the reviewed base interface.
 		if existing[name] {
 			for _, old := range root.Commands() {
 				if old.Name() == name {
+					if !old.Hidden || !replaceablePluginFallbacks[name] ||
+						cmdutil.IsPluginSourced(old) {
+						slog.Warn("plugin: command conflicts with a visible distribution command, skipping",
+							"command", name)
+						cmd = nil
+						break
+					}
 					root.RemoveCommand(old)
-					slog.Debug("plugin: overriding Market command",
+					slog.Debug("plugin: overriding hidden compatibility command",
 						"command", name)
 					break
 				}
 			}
+		}
+		if cmd == nil {
+			continue
 		}
 
 		root.AddCommand(cmd)
@@ -791,46 +1664,52 @@ func deduplicateCommands(root *cobra.Command) {
 	}
 }
 
-func cacheStoreFromEnv() *cache.Store {
-	cacheDir := strings.TrimSpace(os.Getenv(cli.CacheDirEnv))
-	return cache.NewStore(cacheDir)
+type outputSinkState struct {
+	mu       sync.Mutex
+	file     *os.File
+	original io.Writer
+	tempPath string
+	target   string
+	finished bool
 }
 
-// pluginColdTimeouts holds the cold-path discovery budget for plugin MCP
-// servers. Timeouts only apply to the *first* discovery for a given
-// plugin/server; subsequent startups take the warm cache path and bypass
-// the network entirely.
-type pluginColdTimeouts struct {
-	httpNoAuth time.Duration
-	httpAuth   time.Duration
-	stdio      time.Duration
+type outputPublicationError struct {
+	cause error
 }
 
-// resolvePluginColdTimeouts returns the cold-discovery budget for plugin MCP
-// servers, applying the DWS_PLUGIN_COLD_TIMEOUT override when set. Defaults
-// are tuned so healthy cross-region HTTP endpoints succeed on a cold start
-// and Python/Node-based stdio plugins have headroom for interpreter load,
-// while an unreachable host still surrenders in bounded time.
-func resolvePluginColdTimeouts() pluginColdTimeouts {
-	t := pluginColdTimeouts{
-		httpNoAuth: 1 * time.Second,
-		httpAuth:   1500 * time.Millisecond,
-		stdio:      2 * time.Second,
+func (e *outputPublicationError) Error() string { return e.cause.Error() }
+func (e *outputPublicationError) Unwrap() error { return e.cause }
+func (e *outputPublicationError) ExitCode() int { return 5 }
+
+func newOutputPublicationError(message string, cause error) error {
+	return &outputPublicationError{cause: fmt.Errorf("%s: %w", message, cause)}
+}
+
+// emitOutputPublicationFailure replaces a result that was rendered only into a
+// rolled-back transactional file with one observable failure envelope on the
+// original output stream. This is not a second public result: closeOutputSink
+// has removed the temporary file and restored cmd.OutOrStdout before returning
+// the publication error.
+func emitOutputPublicationFailure(cmd *cobra.Command, err error) (code int, handled bool, emitErr error) {
+	var publicationErr *outputPublicationError
+	if cmd == nil || !stderrors.As(err, &publicationErr) || !output.UsesUnifiedResult(cmd) {
+		return 0, false, nil
 	}
-	raw := strings.TrimSpace(os.Getenv(cli.PluginColdTimeoutEnv))
-	if raw == "" {
-		return t
+	state := outputSinkForCommand(cmd)
+	if state == nil {
+		return 0, false, nil
 	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		slog.Warn("plugin: ignoring invalid DWS_PLUGIN_COLD_TIMEOUT",
-			"value", raw, "error", err)
-		return t
+	state.mu.Lock()
+	original := state.original
+	finished := state.finished
+	state.mu.Unlock()
+	if original == nil || !finished {
+		return 0, false, nil
 	}
-	t.httpNoAuth = d
-	t.httpAuth = d
-	t.stdio = d
-	return t
+	cmd.SetOut(original)
+	result := output.FailureWithExitCode(errorInfoFromExecutionError(publicationErr), apperrors.ExitCode(publicationErr))
+	code, emitErr = output.EmitResult(cmd, result)
+	return code, true, emitErr
 }
 
 func configureOutputSink(cmd *cobra.Command) error {
@@ -845,30 +1724,182 @@ func configureOutputSink(cmd *cobra.Command) error {
 	if outputPath == "" {
 		return nil
 	}
+	// A public root may be reused across ExecuteC calls, accumulating one Run
+	// wrapper per execution. When the sink for this invocation is already open,
+	// an inner wrapper must not replace it with a second temporary file.
+	if state := outputSinkForCommand(cmd); state != nil {
+		state.mu.Lock()
+		finished := state.finished
+		state.mu.Unlock()
+		if !finished {
+			return nil
+		}
+	}
 	if err := validateOptionalPath("--output", outputPath); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+	if err := rootMkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return apperrors.NewInternal(fmt.Sprintf("failed to prepare output directory: %v", err))
 	}
-	file, err := os.Create(outputPath)
+	tempPattern := "." + filepath.Base(outputPath) + ".tmp-*"
+	file, err := rootCreateTemp(filepath.Dir(outputPath), tempPattern)
 	if err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to create output file: %v", err))
+		return apperrors.NewInternal(fmt.Sprintf("failed to create temporary output file: %v", err))
 	}
+	originalOut := cmd.OutOrStdout()
 	cmd.SetOut(file)
-	cmd.SetContext(context.WithValue(cmd.Context(), outputFileContextKey{}, file))
+	cmd.SetContext(context.WithValue(cmd.Context(), outputFileContextKey{}, &outputSinkState{
+		file:     file,
+		original: originalOut,
+		tempPath: file.Name(),
+		target:   outputPath,
+	}))
 	return nil
 }
 
+// installOutputSinkRunBoundary defers opening the transactional --output sink
+// to the executed command's Run entry. Cobra runs ValidateRequiredFlags and
+// ValidateFlagGroups after the leaf's PreRunE and immediately before RunE, so
+// opening the sink there keeps two invariants at once: leaf PreRunE hooks can
+// still normalize alias flags into required canonical flags, and a validation
+// failure can never strand a temporary output file. Run-only leaves are
+// converted to RunE so a sink setup failure remains a returned error. Post-run
+// hooks keep the error cleanup wrapping so a post-run failure still aborts the
+// transaction; pre-run hooks need no wrapping because the sink cannot exist
+// before Run entry.
+func installOutputSinkRunBoundary(cmd *cobra.Command) {
+	if cmd == nil {
+		return
+	}
+	openSinkAndRun := func(run func(*cobra.Command, []string) error) func(*cobra.Command, []string) error {
+		return func(cmd *cobra.Command, args []string) error {
+			// 输出初始化也可能早退；它必须处于一次性授权参数的清理边界内。
+			defer resetAuthExchangeInvocationFlags(cmd)
+			defer resetAuthProviderLoginInvocationFlags(cmd)
+			defer resetAuthOIDCExchangeInvocationFlags(cmd)
+			if err := configureOutputSink(cmd); err != nil {
+				return err
+			}
+			return runWithOutputSinkErrorCleanup(cmd, func() error { return run(cmd, args) })
+		}
+	}
+	if cmd.RunE != nil {
+		cmd.RunE = openSinkAndRun(cmd.RunE)
+	} else if cmd.Run != nil {
+		original := cmd.Run
+		cmd.Run = nil
+		cmd.RunE = openSinkAndRun(func(cmd *cobra.Command, args []string) error {
+			original(cmd, args)
+			return nil
+		})
+	}
+	if cmd.PostRunE != nil {
+		original := cmd.PostRunE
+		cmd.PostRunE = func(cmd *cobra.Command, args []string) error {
+			return runWithOutputSinkErrorCleanup(cmd, func() error { return original(cmd, args) })
+		}
+	}
+	if cmd.PostRun != nil {
+		original := cmd.PostRun
+		cmd.PostRun = func(cmd *cobra.Command, args []string) {
+			_ = runWithOutputSinkErrorCleanup(cmd, func() error {
+				original(cmd, args)
+				return nil
+			})
+		}
+	}
+}
+
+func runWithOutputSinkErrorCleanup(cmd *cobra.Command, run func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			warnAbortOutputSink(cmd)
+			panic(r)
+		}
+		if err != nil {
+			warnAbortOutputSink(cmd)
+		}
+	}()
+	return run()
+}
+
+func warnAbortOutputSink(cmd *cobra.Command) {
+	if closeErr := abortOutputSink(cmd); closeErr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: close output sink: %v\n", closeErr)
+	}
+}
+
 func closeOutputSink(cmd *cobra.Command) error {
-	file, ok := cmd.Context().Value(outputFileContextKey{}).(*os.File)
-	if !ok || file == nil {
+	state := outputSinkForCommand(cmd)
+	if state == nil {
 		return nil
 	}
-	if err := file.Close(); err != nil {
-		return apperrors.NewInternal(fmt.Sprintf("failed to close output file: %v", err))
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	// A reusable Cobra tree must never retain the transactional file as its
+	// stdout after this execution. Restore the caller's writer on every terminal
+	// path, including sync/close/rename failures and repeated cleanup calls.
+	if state.original != nil {
+		cmd.SetOut(state.original)
+	}
+	if state.finished {
+		return nil
+	}
+	state.finished = true
+	if err := rootSyncFile(state.file); err != nil {
+		_ = rootCloseFile(state.file)
+		_ = rootRemoveFile(state.tempPath)
+		return newOutputPublicationError("failed to sync output file", err)
+	}
+	if err := rootCloseFile(state.file); err != nil {
+		_ = rootRemoveFile(state.tempPath)
+		return newOutputPublicationError("failed to close output file", err)
+	}
+	if err := rootRenameFile(state.tempPath, state.target); err != nil {
+		_ = rootRemoveFile(state.tempPath)
+		return newOutputPublicationError("failed to publish output file", err)
 	}
 	return nil
+}
+
+func abortOutputSink(cmd *cobra.Command) error {
+	state := outputSinkForCommand(cmd)
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.finished {
+		return nil
+	}
+	state.finished = true
+	// A business error still needs the root execution boundary to publish one
+	// typed failure envelope. Restore the pre-transaction writer before closing
+	// and unlinking the temporary file so that failure emission cannot target a
+	// closed descriptor. The final --output target remains untouched.
+	if state.original != nil {
+		cmd.SetOut(state.original)
+	}
+	closeErr := rootCloseFile(state.file)
+	removeErr := rootRemoveFile(state.tempPath)
+	if closeErr != nil {
+		return apperrors.NewInternal(fmt.Sprintf("failed to close output file: %v", closeErr))
+	}
+	if removeErr != nil && !stderrors.Is(removeErr, os.ErrNotExist) {
+		return apperrors.NewInternal(fmt.Sprintf("failed to remove temporary output file: %v", removeErr))
+	}
+	return nil
+}
+
+func outputSinkForCommand(cmd *cobra.Command) *outputSinkState {
+	if cmd == nil || cmd.Context() == nil {
+		return nil
+	}
+	state, _ := cmd.Context().Value(outputFileContextKey{}).(*outputSinkState)
+	if state == nil || state.file == nil {
+		return nil
+	}
+	return state
 }
 
 func validateOptionalPath(flagName, path string) error {
@@ -882,171 +1913,12 @@ func validateOptionalPath(flagName, path string) error {
 	return nil
 }
 
-func cacheDirectoryStats(root string) (int, int64, error) {
-	if strings.TrimSpace(root) == "" {
-		return 0, 0, nil
-	}
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return 0, 0, nil
-		}
-		return 0, 0, err
-	}
-
-	files := 0
-	var bytes int64
-	err := filepath.WalkDir(root, func(entryPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		files++
-		bytes += info.Size()
-		return nil
-	})
-	return files, bytes, err
-}
-
-func selectServersForProduct(servers []market.ServerDescriptor, product string) []market.ServerDescriptor {
-	product = strings.TrimSpace(strings.ToLower(product))
-	if product == "" {
-		return servers
-	}
-
-	selected := make([]market.ServerDescriptor, 0)
-	for _, server := range servers {
-		candidates := []string{
-			strings.ToLower(strings.TrimSpace(server.DisplayName)),
-			strings.ToLower(strings.TrimSpace(server.Key)),
-			strings.ToLower(strings.TrimSpace(path.Base(server.Endpoint))),
-		}
-		for _, candidate := range candidates {
-			if candidate == "" {
-				continue
-			}
-			if candidate == product || strings.Contains(candidate, product) {
-				selected = append(selected, server)
-				break
-			}
-		}
-	}
-	return selected
-}
-
-func filterRefreshableServers(servers []market.ServerDescriptor) []market.ServerDescriptor {
-	filtered := make([]market.ServerDescriptor, 0, len(servers))
-	for _, server := range servers {
-		if server.CLI.Skip {
-			continue
-		}
-		filtered = append(filtered, server)
-	}
-	return filtered
-}
-
-func clearRuntimeCacheForServers(store *cache.Store, partition string, servers []market.ServerDescriptor) error {
-	for _, server := range servers {
-		for _, cacheKey := range cacheKeysForServer(server) {
-			if err := store.DeleteTools(partition, cacheKey); err != nil {
-				return err
-			}
-		}
-		for _, cacheKey := range detailCacheKeysForServer(server) {
-			if err := store.DeleteDetail(partition, cacheKey); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func cacheKeysForServer(server market.ServerDescriptor) []string {
-	seen := make(map[string]struct{}, 2)
-	keys := make([]string, 0, 2)
-	for _, candidate := range []string{
-		strings.TrimSpace(server.Key),
-		strings.TrimSpace(server.CLI.ID),
-	} {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		keys = append(keys, candidate)
-	}
-	return keys
-}
-
-func detailCacheKeysForServer(server market.ServerDescriptor) []string {
-	key := strings.TrimSpace(server.Key)
-	if key != "" {
-		return []string{key}
-	}
-	id := strings.TrimSpace(server.CLI.ID)
-	if id != "" {
-		return []string{id}
-	}
-	return nil
-}
-
-func cleanCacheFiles(root, product string, staleOnly bool) (int, error) {
-	if strings.TrimSpace(root) == "" {
-		return 0, nil
-	}
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-
-	staleCutoff := time.Now().UTC().Add(-cache.ToolsTTL)
-	product = strings.TrimSpace(strings.ToLower(product))
-	removed := 0
-
-	err := filepath.WalkDir(root, func(entryPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-
-		normalizedPath := strings.ToLower(filepath.ToSlash(entryPath))
-		if product != "" && !strings.Contains(normalizedPath, product) {
-			return nil
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if staleOnly && info.ModTime().After(staleCutoff) {
-			return nil
-		}
-		if err := os.Remove(entryPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		removed++
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return removed, nil
-}
-
 // fileLogger holds the package-level file logger for diagnostics.
 // It is initialized by configureLogLevel and closed by CloseFileLogger.
-var fileLogger *logging.FileLogger
+var (
+	fileLoggerMu sync.Mutex
+	fileLogger   *logging.FileLogger
+)
 
 // configureLogLevel sets the global slog level based on --debug and --verbose flags
 // and initializes the file logger for diagnostics.
@@ -1068,14 +1940,24 @@ func configureLogLevel(flags *GlobalFlags) {
 
 	// Initialize file logger — writes to ~/.dws/logs/dws.log at DEBUG level
 	// regardless of stderr level. All slog calls are captured for diagnostics.
-	fileLogger = logging.Setup(defaultConfigDir())
-	fileHandler := slog.NewJSONHandler(fileLogger.Writer(), &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := logging.Setup(defaultConfigDir())
+	fileHandler := slog.NewJSONHandler(logger.Writer(), &slog.HandlerOptions{Level: slog.LevelDebug})
+	defaultLogger := slog.New(logging.NewMultiHandler(stderrHandler, fileHandler))
 
-	slog.SetDefault(slog.New(logging.NewMultiHandler(stderrHandler, fileHandler)))
+	fileLoggerMu.Lock()
+	defer fileLoggerMu.Unlock()
+	previous := fileLogger
+	fileLogger = logger
+	slog.SetDefault(defaultLogger)
+	if previous != nil {
+		_ = previous.Close()
+	}
 }
 
 // FileLoggerInstance returns the package-level file logger, or nil if not initialized.
 func FileLoggerInstance() *slog.Logger {
+	fileLoggerMu.Lock()
+	defer fileLoggerMu.Unlock()
 	if fileLogger == nil {
 		return nil
 	}
@@ -1084,167 +1966,99 @@ func FileLoggerInstance() *slog.Logger {
 
 // CloseFileLogger flushes and closes the file logger.
 func CloseFileLogger() {
+	fileLoggerMu.Lock()
+	defer fileLoggerMu.Unlock()
 	if fileLogger != nil {
-		fileLogger.Close()
+		_ = fileLogger.Close()
+		fileLogger = nil
 	}
 }
 
-// loadPlugins scans plugin directories, injects their MCP servers into
-// the dynamic server registry, and registers their pipeline hooks.
-// This runs before legacy command construction so that plugin servers
-// are available for EnvironmentLoader.Load().
-func loadPlugins(engine *pipeline.Engine, runner executor.Runner) []*cobra.Command {
+// loadPlugins registers versioned plugin manifests, stdio clients, hooks, and
+// skills. It deliberately does not initialize MCP transports or call
+// tools/list while constructing the command tree.
+type pluginServerCandidate struct {
+	owner       *plugin.Plugin
+	order       int
+	descriptor  mcptypes.ServerDescriptor
+	stdioClient *plugin.StdioServerClient
+}
+
+type pluginIdentityOwner struct {
+	plugin    *plugin.Plugin
+	serverKey string
+	rootName  string
+	shareable bool
+}
+
+func loadPlugins(root *cobra.Command, engine *pipeline.Engine, runner executor.Runner, profileSelector string) []*cobra.Command {
 	pluginLoader := plugin.NewLoader(RawVersion())
 
 	// 0a. Inject plugin config values from settings.json as environment
 	// variables so that expandPluginVars can resolve ${KEY} references
 	// in plugin.json headers, endpoints, etc. User-set env vars take
 	// precedence (InjectPluginConfigEnv skips already-set keys).
-	pluginLoader.InjectPluginConfigEnv()
+	if rootPluginInjectConfigEnv(pluginLoader) {
+		rootPluginLoadHadSideEffects.Store(true)
+	}
 
-	// Load TokenData once; reused for stdio injection below.
-	tokenData, _ := authpkg.LoadTokenData(defaultConfigDir())
+	// Resolve the plugin user identity from the profile metadata file only.
+	// Plugin stdio servers need UserID/CorpID as environment identity — never
+	// the access token — and both live in profiles.json, so the keychain-
+	// encrypted token (a ~300ms synchronous security-CLI spawn per
+	// invocation on macOS) is not read during command-tree construction.
+	// The same file-only read is already the telemetry identity pattern.
 	var userCtx *plugin.UserContext
-	if tokenData != nil {
-		// Inject user context if either UserID or CorpID is present.
-		if tokenData.UserID != "" || tokenData.CorpID != "" {
+	if profile, err := rootPluginResolveIdentity(defaultConfigDir(), profileSelector); err == nil && profile != nil {
+		userID := strings.TrimSpace(profile.UserID)
+		corpID := strings.TrimSpace(profile.CorpID)
+		if userID != "" || corpID != "" {
 			userCtx = &plugin.UserContext{
-				UserID: tokenData.UserID,
-				CorpID: tokenData.CorpID,
+				UserID: userID,
+				CorpID: corpID,
 			}
 		}
 	}
 
 	// 1. Load user plugins (per settings.json)
-	userPlugins := pluginLoader.LoadUser()
+	userPlugins := rootPluginLoadUser(pluginLoader)
 
 	// 2. Load dev plugins (registered via `dws plugin dev`)
-	devPlugins := pluginLoader.LoadDev()
+	devPlugins := rootPluginLoadDev(pluginLoader)
+	sortPluginsForRegistration(userPlugins)
+	sortPluginsForRegistration(devPlugins)
 
 	allPlugins := append(userPlugins, devPlugins...)
-
-	// 3. Discover tools from streamable-http servers and build CLI commands.
-	//    Third-party servers with auth headers are discovered in parallel
-	//    to avoid sequential 10s timeouts when multiple remote servers exist.
-	var pluginCmds []*cobra.Command
-	tc := transport.NewClient(nil)
-
-	// Collect all server descriptors and register auth first (fast, no I/O).
-	type pluginServer struct {
-		plugin *plugin.Plugin
-		srv    market.ServerDescriptor
+	if len(allPlugins) > 0 {
+		rootPluginLoadHadSideEffects.Store(true)
 	}
-	var httpServers []pluginServer
+	descriptorsByPlugin := make(map[*plugin.Plugin][]mcptypes.ServerDescriptor, len(allPlugins))
 
-	for _, p := range allPlugins {
-		for _, srv := range p.ToServerDescriptors() {
-			AppendDynamicServer(srv)
-
-			if len(srv.AuthHeaders) > 0 {
-				registerPluginAuthFromHeaders(srv)
-			}
-
-			if srv.HasCLIMeta {
-				httpServers = append(httpServers, pluginServer{plugin: p, srv: srv})
-			}
+	// 3. Resolve every descriptor once, then choose identity winners before
+	// mutating endpoint, auth, or stdio-client registries. This keeps the
+	// visible command and its transport owned by the same plugin.
+	candidates := collectPluginServerCandidates(allPlugins, func() *plugin.UserContext { return userCtx })
+	accepted := selectPluginServerCandidates(root, candidates)
+	for _, candidate := range accepted {
+		if candidate.stdioClient != nil {
+			rootRegisterResolvedStdioServer(
+				candidate.owner,
+				*candidate.stdioClient,
+				candidate.descriptor,
+			)
+		} else {
+			rootRegisterPluginHTTPServer(candidate.descriptor)
 		}
+		descriptorsByPlugin[candidate.owner] = append(
+			descriptorsByPlugin[candidate.owner],
+			candidate.descriptor,
+		)
 	}
 
-	// Collect all stdio clients up front so HTTP + stdio discovery can run
-	// concurrently — the slowest plugin (typically an unreachable HTTP
-	// endpoint hitting its dial timeout) dominates the parallel wall-clock,
-	// not the sum of every plugin's cold timeout.
-	type stdioEntry struct {
-		plugin *plugin.Plugin
-		sc     plugin.StdioServerClient
-	}
-	var stdioEntries []stdioEntry
-	for _, p := range allPlugins {
-		for _, sc := range p.StdioClients(userCtx) {
-			// Use background context so the subprocess lives for the CLI
-			// process lifetime (not killed by a short timeout).
-			if err := sc.Client.Start(context.Background()); err != nil {
-				slog.Warn("plugin: failed to start stdio server",
-					"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
-				continue
-			}
-			stdioEntries = append(stdioEntries, stdioEntry{plugin: p, sc: sc})
-		}
-	}
-
-	// Share one cache.Store across all discovery goroutines. Each goroutine
-	// writes to a distinct serverKey path ("tools/<plugin>_<server>.json") with
-	// atomic tmp+rename, so concurrent writes to different keys never collide
-	// on the filesystem. Global in-process registries (AppendDynamicServer,
-	// RegisterStdioClient) carry their own sync.Mutex; see direct_runtime.go
-	// and stdio_registry.go.
-	sharedStore := cacheStoreFromEnv()
-	coldTimeouts := resolvePluginColdTimeouts()
-
-	// Phase A: stdio overlay-first registration (synchronous, no I/O).
-	// Plugins whose overlay.json declares ToolOverrides register their full
-	// command tree up-front from manifest metadata alone — no subprocess
-	// handshake required. This fixes the "discovery fails → no commands
-	// ever appear" lock-out and keeps `dws --help` reliable even when the
-	// underlying MCP server is temporarily unavailable.
-	var legacyStdioEntries []stdioEntry
-	for _, e := range stdioEntries {
-		cmds, _, ok := registerStdioServerFromOverlay(e.plugin, e.sc, runner, sharedStore)
-		if !ok {
-			legacyStdioEntries = append(legacyStdioEntries, e)
-			continue
-		}
-		pluginCmds = append(pluginCmds, cmds...)
-	}
-
-	// Phase B: fan out discovery in parallel.
-	//   - HTTP plugins: same behaviour as before (discovery-first).
-	//   - stdio overlay-first plugins: async cache refresh only; their
-	//     commands are already registered. Failures are non-fatal and do
-	//     NOT poison the warm-cache with a null-tools snapshot.
-	//   - stdio legacy plugins (overlay without toolOverrides): preserve
-	//     the old discovery-first path for backwards compatibility.
-	httpResults := make([][]*cobra.Command, len(httpServers))
-	legacyStdioResults := make([][]*cobra.Command, len(legacyStdioEntries))
-	var wg sync.WaitGroup
-	for i, ps := range httpServers {
-		wg.Add(1)
-		go func(idx int, ps pluginServer) {
-			defer wg.Done()
-			httpResults[idx] = registerHTTPServer(ps.plugin, ps.srv, tc, runner, sharedStore, coldTimeouts)
-		}(i, ps)
-	}
-	// overlay-first stdio: async refresh (no command building here).
-	for _, e := range stdioEntries {
-		if !hasOverlayToolOverrides(e.plugin, e.sc) {
-			continue
-		}
-		wg.Add(1)
-		go func(e stdioEntry) {
-			defer wg.Done()
-			refreshStdioToolsCache(e.plugin, e.sc, sharedStore, coldTimeouts)
-		}(e)
-	}
-	// legacy stdio: discovery-first (commands depend on tool list).
-	for i, e := range legacyStdioEntries {
-		wg.Add(1)
-		go func(idx int, e stdioEntry) {
-			defer wg.Done()
-			legacyStdioResults[idx] = registerStdioServer(e.plugin, e.sc, runner, sharedStore, coldTimeouts)
-		}(i, e)
-	}
-	wg.Wait()
-	for _, cmds := range httpResults {
-		pluginCmds = append(pluginCmds, cmds...)
-	}
-	for _, cmds := range legacyStdioResults {
-		pluginCmds = append(pluginCmds, cmds...)
-	}
-
-	// 5. Register plugin hooks into pipeline engine
+	// 4. Register plugin hooks into pipeline engine
 	if engine != nil {
 		for _, p := range allPlugins {
-			hooksCfg, err := p.LoadHooks()
+			hooksCfg, err := rootPluginLoadHooks(p)
 			if err != nil {
 				slog.Warn("plugin: failed to load hooks",
 					"plugin", p.Manifest.Name, "error", err)
@@ -1259,8 +2073,8 @@ func loadPlugins(engine *pipeline.Engine, runner executor.Runner) []*cobra.Comma
 		}
 	}
 
-	// 7. Sync plugin skills to agent directories
-	plugin.SyncSkills(allPlugins)
+	// 5. Sync plugin skills to agent directories
+	rootPluginSyncSkills(allPlugins)
 
 	if len(allPlugins) > 0 {
 		slog.Debug("plugins loaded",
@@ -1269,151 +2083,238 @@ func loadPlugins(engine *pipeline.Engine, runner executor.Runner) []*cobra.Comma
 		)
 	}
 
-	return pluginCmds
-}
-
-// pluginCacheKey derives the cache key used to persist a plugin MCP server's
-// tool list. Prefixed with "plugin:" so entries are namespaced apart from the
-// Market-derived cache, and visible distinctly via `dws cache status`.
-func pluginCacheKey(pluginName, serverKey string) string {
-	return "plugin:" + pluginName + ":" + serverKey
-}
-
-// registerHTTPServer discovers tools from a streamable-http MCP server and
-// builds CLI commands. Used for plugin-owned HTTP servers that provide CLI metadata.
-//
-// Startup-latency strategy (issue #119):
-//   - Warm cache: build commands from the persisted tools snapshot
-//     synchronously — no network I/O. `dws --help` returns in ms even when
-//     the plugin endpoint is unreachable.
-//   - Cold cache: synchronous discovery (Initialize + ListTools) with a tight
-//     timeout. The outcome — success or failure — is persisted so the next
-//     invocation hits the warm path. Refresh on demand via `dws cache clean`
-//     / `dws cache refresh`; the cache TTL (7d) otherwise expires naturally.
-//
-// When the server descriptor carries AuthHeaders (from plugin.json "headers"),
-// a dedicated transport.Client is created with the plugin's Bearer token and
-// trusted domains so that third-party MCP servers requiring independent
-// authentication (e.g. Alibaba Cloud Bailian) can be discovered at startup.
-func registerHTTPServer(p *plugin.Plugin, srv market.ServerDescriptor, tc *transport.Client, runner executor.Runner, store *cache.Store, timeouts pluginColdTimeouts) []*cobra.Command {
-	partition := config.DefaultPartition
-	cacheKey := pluginCacheKey(p.Manifest.Name, srv.Key)
-
-	if snapshot, freshness, err := store.LoadTools(partition, cacheKey); err == nil {
-		slog.Debug("plugin: http server served from cache",
-			"plugin", p.Manifest.Name, "server", srv.Key,
-			"tools", len(snapshot.Tools), "freshness", string(freshness))
-		return buildHTTPCommandsFromTools(srv, snapshot.Tools, runner)
+	var pluginCommands []*cobra.Command
+	for _, p := range allPlugins {
+		// Build each plugin independently. addPluginCommandsSafe deliberately
+		// resolves cross-plugin root conflicts with first-plugin-wins semantics.
+		pluginCommands = append(pluginCommands, buildPluginCommands(descriptorsByPlugin[p], runner, root)...)
 	}
+	return pluginCommands
+}
 
-	// Cold cache: synchronous discovery. Persist the outcome even on failure
-	// (empty tools == negative cache) so the next invocation takes the fast
-	// path regardless of endpoint health.
-	tools := discoverHTTPTools(p, srv, tc, timeouts)
-	_ = store.SaveTools(partition, cacheKey, cache.ToolsSnapshot{
-		ServerKey: cacheKey,
-		Tools:     tools,
+func sortPluginsForRegistration(plugins []*plugin.Plugin) {
+	sort.SliceStable(plugins, func(i, j int) bool {
+		left := strings.TrimSpace(plugins[i].Manifest.Name) + "\x00" + strings.TrimSpace(plugins[i].Root)
+		right := strings.TrimSpace(plugins[j].Manifest.Name) + "\x00" + strings.TrimSpace(plugins[j].Root)
+		return left < right
 	})
-	return buildHTTPCommandsFromTools(srv, tools, runner)
 }
 
-// discoverHTTPTools performs the blocking Initialize + ListTools handshake
-// for an HTTP MCP server and returns the discovered tools. Returns nil on
-// any transport/protocol error; errors are logged at Debug level.
-func discoverHTTPTools(p *plugin.Plugin, srv market.ServerDescriptor, tc *transport.Client, timeouts pluginColdTimeouts) []transport.ToolDescriptor {
-	// Cold-path budget. An unreachable endpoint will burn the full window
-	// via the TCP dial timeout; a healthy localhost/third-party endpoint
-	// typically responds in <200 ms. Third-party servers with auth get a
-	// slightly larger window to accommodate TLS + auth RTT. Operators with
-	// cross-region endpoints can relax the window via DWS_PLUGIN_COLD_TIMEOUT.
-	// The outcome is persisted as a negative cache so subsequent startups
-	// (80 ms warm) are unaffected. See issue #119.
-	timeout := timeouts.httpNoAuth
-	if len(srv.AuthHeaders) > 0 {
-		timeout = timeouts.httpAuth
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	discoveryClient := tc
-	if len(srv.AuthHeaders) > 0 {
-		discoveryClient = buildPluginAuthClient(tc, srv)
-	}
-
-	if _, err := discoveryClient.Initialize(ctx, srv.Endpoint); err != nil {
-		slog.Debug("plugin: http server offline, skipping tool discovery",
-			"plugin", p.Manifest.Name, "server", srv.Key)
-		return nil
-	}
-
-	toolsResult, err := discoveryClient.ListTools(ctx, srv.Endpoint)
-	if err != nil {
-		slog.Debug("plugin: http ListTools failed",
-			"plugin", p.Manifest.Name, "server", srv.Key, "error", err)
-		return nil
-	}
-	return toolsResult.Tools
-}
-
-// buildHTTPCommandsFromTools converts a tool list into Cobra commands via
-// the BuildDynamicCommands path. Returns nil for an empty tool list.
-func buildHTTPCommandsFromTools(srv market.ServerDescriptor, tools []transport.ToolDescriptor, runner executor.Runner) []*cobra.Command {
-	if len(tools) == 0 {
-		return nil
-	}
-
-	detailsByID := make(map[string][]market.DetailTool)
-	var detailTools []market.DetailTool
-	for _, tool := range tools {
-		schemaJSON := ""
-		if tool.InputSchema != nil {
-			if data, marshalErr := json.Marshal(tool.InputSchema); marshalErr == nil {
-				schemaJSON = string(data)
-			}
+func collectPluginServerCandidates(
+	plugins []*plugin.Plugin,
+	userCtxFn func() *plugin.UserContext,
+) []pluginServerCandidate {
+	var candidates []pluginServerCandidate
+	for order, owner := range plugins {
+		for _, descriptor := range rootPluginDescriptors(owner) {
+			candidates = append(candidates, pluginServerCandidate{
+				owner:      owner,
+				order:      order,
+				descriptor: descriptor,
+			})
 		}
-		detailTools = append(detailTools, market.DetailTool{
-			ToolName:    tool.Name,
-			ToolTitle:   tool.Title,
-			ToolDesc:    tool.Description,
-			IsSensitive: tool.Sensitive,
-			ToolRequest: schemaJSON,
-		})
-	}
-	detailsByID[strings.TrimSpace(srv.CLI.ID)] = detailTools
-
-	// If the server has no ToolOverrides (e.g. third-party MCP servers that
-	// only declare cli.id and cli.command), auto-generate one override per
-	// discovered tool so BuildDynamicCommands can create leaf commands.
-	if len(srv.CLI.ToolOverrides) == 0 {
-		srv.CLI.ToolOverrides = make(map[string]market.CLIToolOverride, len(tools))
-		for _, tool := range tools {
-			srv.CLI.ToolOverrides[tool.Name] = market.CLIToolOverride{
-				CLIName: deriveToolCLIName(tool.Name),
+		stdioUserCtx := userCtxFn()
+		for _, stdioClient := range rootPluginStdioClients(owner, stdioUserCtx) {
+			descriptor, ok := rootPluginStdioDescriptor(owner, stdioClient)
+			if !ok {
+				continue
 			}
+			clientCopy := stdioClient
+			candidates = append(candidates, pluginServerCandidate{
+				owner:       owner,
+				order:       order,
+				descriptor:  descriptor,
+				stdioClient: &clientCopy,
+			})
 		}
 	}
-
-	return compat.BuildDynamicCommands(
-		[]market.ServerDescriptor{srv}, runner, detailsByID)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].order != candidates[j].order {
+			return candidates[i].order < candidates[j].order
+		}
+		left := strings.TrimSpace(candidates[i].descriptor.Key)
+		right := strings.TrimSpace(candidates[j].descriptor.Key)
+		if left != right {
+			return left < right
+		}
+		return candidates[i].stdioClient == nil && candidates[j].stdioClient != nil
+	})
+	return candidates
 }
 
-// deriveToolCLIName converts an MCP tool name (e.g. "web_search" or
-// "maps.search_poi") into a kebab-case CLI command name ("search" or
-// "search-poi"). It strips common prefixes and replaces underscores/dots
-// with hyphens.
-func deriveToolCLIName(toolName string) string {
-	// Use the last segment after "." as the base name.
-	if idx := strings.LastIndex(toolName, "."); idx >= 0 {
-		toolName = toolName[idx+1:]
+func selectPluginServerCandidates(
+	root *cobra.Command,
+	candidates []pluginServerCandidate,
+) []pluginServerCandidate {
+	distributionProducts := DirectRuntimeProductIDs()
+	owners := make(map[string]pluginIdentityOwner)
+	for identity := range distributionProducts {
+		if replaceablePluginFallbacks[identity] {
+			continue
+		}
+		owners[identity] = pluginIdentityOwner{serverKey: "distribution"}
 	}
-	// Replace underscores with hyphens for kebab-case.
-	return strings.ReplaceAll(toolName, "_", "-")
+
+	accepted := make([]pluginServerCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		descriptor := candidate.descriptor
+		if descriptor.CLI.Skip {
+			continue
+		}
+		if reason := unsupportedPluginDescriptor(root, descriptor); reason != "" {
+			slog.Warn("plugin: descriptor CLI semantics are unsupported, skipping",
+				"plugin", candidate.owner.Manifest.Name,
+				"server", descriptor.Key,
+				"field", reason)
+			continue
+		}
+		if pluginDescriptorConflictsWithDistribution(root, descriptor, distributionProducts) {
+			continue
+		}
+		claims := pluginDescriptorIdentityClaims(descriptor)
+		conflict := ""
+		for identity, shareable := range claims {
+			existing, exists := owners[identity]
+			if !exists {
+				continue
+			}
+			rootName := pluginDescriptorRootName(descriptor)
+			if shareable && existing.shareable &&
+				existing.plugin == candidate.owner &&
+				existing.rootName == rootName {
+				continue
+			}
+			conflict = identity
+			break
+		}
+		if conflict != "" {
+			slog.Warn("plugin: descriptor identity already owned, skipping",
+				"plugin", candidate.owner.Manifest.Name,
+				"server", descriptor.Key,
+				"identity", conflict)
+			continue
+		}
+		rootName := pluginDescriptorRootName(descriptor)
+		for identity, shareable := range claims {
+			if existing, exists := owners[identity]; exists &&
+				shareable && existing.shareable &&
+				existing.plugin == candidate.owner &&
+				existing.rootName == rootName {
+				continue
+			}
+			owners[identity] = pluginIdentityOwner{
+				plugin:    candidate.owner,
+				serverKey: descriptor.Key,
+				rootName:  rootName,
+				shareable: shareable,
+			}
+		}
+		accepted = append(accepted, candidate)
+	}
+	return accepted
 }
 
-// buildPluginAuthClient creates a transport.Client copy with the plugin's
-// Bearer token and trusted domains injected. This allows third-party MCP
-// servers that require independent authentication to be discovered at startup.
-func buildPluginAuthClient(base *transport.Client, srv market.ServerDescriptor) *transport.Client {
+func pluginDescriptorIdentityClaims(descriptor mcptypes.ServerDescriptor) map[string]bool {
+	claims := make(map[string]bool)
+	canonicalID := firstNonEmptyPluginString(descriptor.CLI.ID, descriptor.Key)
+	if canonicalID != "" {
+		claims[canonicalID] = false
+	}
+	for _, identity := range append(
+		[]string{pluginDescriptorRootName(descriptor)},
+		descriptor.CLI.Aliases...,
+	) {
+		identity = strings.TrimSpace(identity)
+		if identity == "" {
+			continue
+		}
+		if _, exists := claims[identity]; !exists {
+			claims[identity] = true
+		}
+	}
+	return claims
+}
+
+func pluginDescriptorRootName(descriptor mcptypes.ServerDescriptor) string {
+	return firstNonEmptyPluginString(
+		descriptor.CLI.Command,
+		descriptor.CLI.ID,
+		descriptor.Key,
+	)
+}
+
+func pluginDescriptorConflictsWithDistribution(
+	root *cobra.Command,
+	descriptor mcptypes.ServerDescriptor,
+	distributionProducts map[string]bool,
+) bool {
+	candidates := append(
+		[]string{
+			firstNonEmptyPluginString(descriptor.CLI.ID, descriptor.Key),
+			pluginDescriptorRootName(descriptor),
+		},
+		descriptor.CLI.Aliases...,
+	)
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if !reservedCommands[candidate] && replaceablePluginFallbacks[candidate] {
+			// The distribution ships only a hidden compatibility fallback for
+			// this name; plugins may claim it and the later command merge in
+			// addPluginCommandsSafe still rejects visible non-fallback owners.
+			continue
+		}
+		if reservedCommands[candidate] ||
+			distributionProducts[candidate] ||
+			distributionRootOwns(root, candidate) {
+			slog.Warn("plugin: descriptor conflicts with a distribution command, skipping",
+				"plugin", descriptor.DisplayName,
+				"server", descriptor.Key,
+				"identity", candidate)
+			return true
+		}
+	}
+	return false
+}
+
+func distributionRootOwns(root *cobra.Command, name string) bool {
+	if root == nil {
+		return false
+	}
+	for _, command := range root.Commands() {
+		if cmdutil.IsPluginSourced(command) {
+			continue
+		}
+		if command.Name() == name {
+			if command.Hidden && replaceablePluginFallbacks[name] {
+				return false
+			}
+			return true
+		}
+		for _, alias := range command.Aliases {
+			if strings.TrimSpace(alias) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func registerPluginHTTPServer(srv mcptypes.ServerDescriptor) {
+	AppendDynamicServer(srv)
+	productID := firstNonEmptyPluginString(srv.CLI.ID, srv.Key)
+	// Register ownership for every accepted HTTP plugin, including anonymous
+	// plugins. Execution must never fall back to the built-in DingTalk OAuth or
+	// Agent-metadata path merely because a plugin has no Authorization Header.
+	RegisterPluginAuth(productID, pluginAuthFromServerDescriptor(srv))
+}
+
+// pluginAuthFromServerDescriptor extracts plugin-owned credentials and custom
+// Headers. A non-nil result also acts as the HTTP plugin ownership marker for
+// anonymous plugins.
+func pluginAuthFromServerDescriptor(srv mcptypes.ServerDescriptor) *PluginAuth {
 	authToken := ""
 	extraHeaders := make(map[string]string)
 	for key, value := range srv.AuthHeaders {
@@ -1423,156 +2324,19 @@ func buildPluginAuthClient(base *transport.Client, srv market.ServerDescriptor) 
 		} else {
 			extraHeaders[key] = value
 		}
-	}
-	if authToken == "" {
-		return base
-	}
-	client := base.WithAuth(authToken, extraHeaders)
-	// Trust the endpoint's hostname so the token is actually sent.
-	if parsed, err := url.Parse(srv.Endpoint); err == nil {
-		host := parsed.Hostname()
-		client.TrustedDomains = []string{host, "*." + host}
-	}
-	return client
-}
-
-// registerPluginAuthFromHeaders extracts authentication credentials from
-// a server descriptor's AuthHeaders and registers them in the global
-// PluginAuth registry. The runner uses this registry at execution time
-// to inject the correct Bearer token for third-party MCP servers.
-func registerPluginAuthFromHeaders(srv market.ServerDescriptor) {
-	authToken := ""
-	extraHeaders := make(map[string]string)
-	for key, value := range srv.AuthHeaders {
-		if strings.EqualFold(key, "Authorization") {
-			authToken = strings.TrimPrefix(value, "Bearer ")
-			authToken = strings.TrimSpace(authToken)
-		} else {
-			extraHeaders[key] = value
-		}
-	}
-	if authToken == "" {
-		return
 	}
 	var trustedDomains []string
 	if parsed, err := url.Parse(srv.Endpoint); err == nil {
 		host := parsed.Hostname()
-		trustedDomains = []string{host, "*." + host}
+		if host != "" {
+			trustedDomains = []string{host, "*." + host}
+		}
 	}
-	productID := strings.TrimSpace(srv.CLI.ID)
-	if productID == "" {
-		productID = srv.Key
-	}
-	RegisterPluginAuth(productID, &PluginAuth{
+	return &PluginAuth{
 		Token:          authToken,
 		ExtraHeaders:   extraHeaders,
 		TrustedDomains: trustedDomains,
-	})
-}
-
-// registerStdioServer initializes a stdio MCP server, discovers its tools
-// via ListTools, builds CLI commands, and registers the StdioClient for
-// runtime dispatch. Returns generated cobra commands.
-//
-// Warm-cache fast path (issue #119): when a tools snapshot is already cached
-// for this plugin/server, skip the Initialize + ListTools RPC round-trip and
-// rebuild commands directly from the snapshot. Cold cache falls back to
-// synchronous discovery with a 4s cap and persists the outcome.
-func registerStdioServer(p *plugin.Plugin, sc plugin.StdioServerClient, runner executor.Runner, store *cache.Store, timeouts pluginColdTimeouts) []*cobra.Command {
-	partition := config.DefaultPartition
-	cacheKey := pluginCacheKey(p.Manifest.Name, sc.Key)
-
-	if snapshot, freshness, err := store.LoadTools(partition, cacheKey); err == nil {
-		slog.Debug("plugin: stdio server served from cache",
-			"plugin", p.Manifest.Name, "server", sc.Key,
-			"tools", len(snapshot.Tools), "freshness", string(freshness))
-		return buildStdioCommands(p, sc, snapshot.Tools, runner)
 	}
-
-	tools := discoverStdioTools(p, sc, timeouts)
-	_ = store.SaveTools(partition, cacheKey, cache.ToolsSnapshot{
-		ServerKey: cacheKey,
-		Tools:     tools,
-	})
-	return buildStdioCommands(p, sc, tools, runner)
-}
-
-// discoverStdioTools performs the blocking Initialize + ListTools handshake
-// on a stdio MCP subprocess. Returns nil on any error (logged at Warn level).
-// The default 2s budget comfortably accommodates Python/Node runtimes whose
-// interpreter + dependency load dominates the first response. Operators with
-// heavier startup chains can relax further via DWS_PLUGIN_COLD_TIMEOUT.
-func discoverStdioTools(p *plugin.Plugin, sc plugin.StdioServerClient, timeouts pluginColdTimeouts) []transport.ToolDescriptor {
-	ctx, cancel := context.WithTimeout(context.Background(), timeouts.stdio)
-	defer cancel()
-
-	if _, err := sc.Client.Initialize(ctx); err != nil {
-		slog.Warn("plugin: stdio initialize failed",
-			"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
-		return nil
-	}
-	toolsResult, err := sc.Client.ListTools(ctx)
-	if err != nil {
-		slog.Warn("plugin: stdio ListTools failed",
-			"plugin", p.Manifest.Name, "server", sc.Key, "error", err)
-		return nil
-	}
-	return toolsResult.Tools
-}
-
-// buildStdioCommands constructs Cobra commands from a tool list and
-// registers the runtime dispatch state (StdioClient + dynamic server).
-// Returns nil for an empty tool list.
-//
-// This is the legacy discovery-first path, used only for stdio plugins whose
-// overlay.json does NOT carry toolOverrides. Plugins that ship toolOverrides
-// register commands up-front via registerStdioServerFromOverlay, bypassing
-// this function entirely (see plugin_stdio_overlay.go).
-func buildStdioCommands(p *plugin.Plugin, sc plugin.StdioServerClient, tools []transport.ToolDescriptor, runner executor.Runner) []*cobra.Command {
-	if len(tools) == 0 {
-		slog.Debug("plugin: stdio server has no tools",
-			"plugin", p.Manifest.Name, "server", sc.Key)
-		return nil
-	}
-
-	overlay := resolveStdioOverlay(p, sc)
-
-	// Auto-generate ToolOverrides from discovered tools when not provided
-	// by the manifest/overlay (legacy discovery-first path).
-	if len(overlay.ToolOverrides) == 0 {
-		overlay.ToolOverrides = make(map[string]market.CLIToolOverride)
-		if len(overlay.Prefixes) == 0 {
-			overlay.Prefixes = []string{overlay.ID}
-		}
-		for _, tool := range tools {
-			overlay.ToolOverrides[tool.Name] = market.CLIToolOverride{
-				IsSensitive: tool.Sensitive,
-			}
-		}
-	}
-
-	descriptor := market.ServerDescriptor{
-		Key:         sc.Key,
-		DisplayName: p.Manifest.Name + "/" + sc.Key,
-		Description: p.Manifest.Description,
-		Endpoint:    StdioEndpoint(p.Manifest.Name, sc.Key),
-		Source:      "plugin",
-		CLI:         overlay,
-		HasCLIMeta:  true,
-	}
-
-	AppendDynamicServer(descriptor)
-	RegisterStdioClient(p.Manifest.Name+"/"+sc.Key, sc.Client)
-
-	detailsByID := toolsToDetails(tools, overlay.ID)
-	cmds := compat.BuildDynamicCommands(
-		[]market.ServerDescriptor{descriptor}, runner, detailsByID)
-
-	slog.Debug("plugin: stdio server registered",
-		"plugin", p.Manifest.Name, "server", sc.Key,
-		"tools", len(tools), "commands", len(cmds))
-
-	return cmds
 }
 
 // newPipelineEngine creates and configures the pipeline engine with
@@ -1580,24 +2344,50 @@ func buildStdioCommands(p *plugin.Plugin, sc plugin.StdioServerClient, tools []t
 // Register → PreParse → PostParse → PreRequest → PostResponse.
 //
 // Phases are invoked at their respective integration points:
-//   - Register:     during command tree construction (newMCPCommand)
+//   - Register:     during command tree construction (cli.NewMCPCommand)
 //   - PreParse:     before Cobra parses raw argv (RunPreParse)
 //   - PostParse:    after Cobra parsing, before validation (canonical RunE)
 //   - PreRequest:   after validation, before JSON-RPC dispatch (canonical RunE)
 //   - PostResponse: after transport returns, before stdout (canonical RunE)
 func newPipelineEngine() *pipeline.Engine {
 	engine := pipeline.NewEngine()
+	engine.SetCommandPathFallbackLookup(func(path string) (pipeline.CommandPathFallback, bool) {
+		entry, ok := cli.LookupCommandPathFallback(path)
+		if !ok {
+			return pipeline.CommandPathFallback{}, false
+		}
+		return pipeline.CommandPathFallback{
+			From:       entry.From,
+			Mode:       string(entry.Mode),
+			To:         entry.To,
+			Candidates: append([]string(nil), entry.Candidates...),
+		}, true
+	})
 	engine.RegisterAll(
 		// Register handler runs during command tree building.
 		handlers.RegisterHandler{},
 
-		// PreParse handlers run in order: alias → sticky → paramname.
-		// Alias normalises case first (--userId → --user-id), then
-		// sticky splits glued values (--limit100 → --limit 100), then
-		// paramname fixes near-miss typos (--limt → --limit).
+		// PreParse handlers run in order: alias → semantic → sticky → paramname
+		// → boolvalue.
+		// Alias normalises case first (--userId → --user-id), then semantic
+		// resolves reviewed synonyms to the real flag (--keyword → --query),
+		// then sticky splits glued values (--limit100 → --limit 100), then
+		// paramname fixes near-miss typos (--limt → --limit). Boolvalue runs
+		// last so detached values for every real boolean flag (for example
+		// `--dry-run false`) become explicit `--flag=false` tokens before pflag
+		// can interpret the bare flag as true.
 		handlers.AliasHandler{},
+		handlers.SemanticAliasHandler{
+			// Inject the build-time reduced alias table with native types so
+			// the handler package stays decoupled from cli.
+			Lookup: func(rawCommandPath string) (map[string]string, []string, []string, bool) {
+				e, ok := cli.LookupParamAlias(rawCommandPath)
+				return e.Aliases, e.Blocked, e.Ambiguous, ok
+			},
+		},
 		handlers.StickyHandler{},
 		handlers.ParamNameHandler{},
+		handlers.BoolValueHandler{},
 
 		// PostParse handlers normalise structured values.
 		handlers.ParamValueHandler{},
@@ -1609,4 +2399,8 @@ func newPipelineEngine() *pipeline.Engine {
 		handlers.PostResponseHandler{},
 	)
 	return engine
+}
+
+func runRootHelp(cmd *cobra.Command, _ []string) error {
+	return cmd.Help()
 }

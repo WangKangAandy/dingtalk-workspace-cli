@@ -15,40 +15,45 @@ package cmdutil
 
 import "github.com/spf13/cobra"
 
-// SourceAnnotation is the cobra.Command.Annotations key used to record where
-// a top-level command came from. Edition overlays (e.g. wukong) read this
-// annotation to distinguish envelope-authored dynamic commands from
-// helper-fallback commands that merely happen to share a name. Keeping the
-// key and value literals in one place prevents spelling drift between the
-// core (which sets the annotation) and overlays (which read it).
+// SourceAnnotation records where a command tree came from. Edition overlays
+// use it to distinguish runtime-authored commands from helper fallbacks that
+// happen to share the same top-level product name.
 const SourceAnnotation = "dws.source"
 
-// SourceEnvelope marks a command as authored by the discovery envelope and
-// therefore authoritative at runtime. Only commands built from a
-// market.ServerDescriptor / CLIOverlay should carry this value. Helper
-// fallbacks and other sources must leave the annotation unset.
+// SourceEnvelope marks a command as authored by the runtime discovery envelope.
 const SourceEnvelope = "envelope"
 
-// MarkEnvelopeSource stamps the envelope provenance annotation on cmd.
-// Safe to call on commands that may not have an Annotations map yet.
-// Callers in core code are the only ones that should invoke this — overlays
-// read the annotation but must not fabricate envelope provenance.
+// SourcePlugin marks a command as an installed plugin extension. Plugin
+// commands are part of the runtime CLI surface, not the embedded base Schema.
+const SourcePlugin = "plugin"
+
+// MarkEnvelopeSource stamps cmd with runtime discovery provenance.
 func MarkEnvelopeSource(cmd *cobra.Command) {
+	markSource(cmd, SourceEnvelope)
+}
+
+// MarkPluginSource stamps cmd with installed-plugin provenance.
+func MarkPluginSource(cmd *cobra.Command) {
+	markSource(cmd, SourcePlugin)
+}
+
+func markSource(cmd *cobra.Command, source string) {
 	if cmd == nil {
 		return
 	}
 	if cmd.Annotations == nil {
 		cmd.Annotations = map[string]string{}
 	}
-	cmd.Annotations[SourceAnnotation] = SourceEnvelope
+	cmd.Annotations[SourceAnnotation] = source
 }
 
-// IsEnvelopeSourced reports whether cmd carries the envelope provenance
-// annotation. Commands without the annotation are treated as non-authoritative
-// (helper fallbacks, overlay-injected stubs, etc.).
+// IsEnvelopeSourced reports whether cmd was authored by the runtime discovery
+// envelope.
 func IsEnvelopeSourced(cmd *cobra.Command) bool {
-	if cmd == nil || cmd.Annotations == nil {
-		return false
-	}
-	return cmd.Annotations[SourceAnnotation] == SourceEnvelope
+	return cmd != nil && cmd.Annotations[SourceAnnotation] == SourceEnvelope
+}
+
+// IsPluginSourced reports whether cmd came from an installed plugin.
+func IsPluginSourced(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Annotations[SourceAnnotation] == SourcePlugin
 }

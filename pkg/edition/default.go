@@ -13,20 +13,20 @@
 
 package edition
 
-// DefaultOSSClawType is the wire value for request header claw-type in
-// the open-source build. It is intentionally hard-wired — the open-source
-// CLI does NOT derive claw-type from DINGTALK_AGENT or any other caller
-// input, so third-party hosts get a predictable header regardless of
-// their environment.
+import "github.com/DingTalk-Real-AI/dingtalk-workspace-cli/internal/syncdata"
+
+// DefaultOSSClawType is the fixed wire value for request header claw-type in
+// the open-source build. It is intentionally independent of caller-provided
+// environment variables so PAT and routing behaviour stays predictable.
 const DefaultOSSClawType = "openClaw"
 
 // defaultHooks returns the open-source edition defaults.
 //
-// MergeHeaders is the only hook that ships with behaviour: it pins the
-// `claw-type` request header to DefaultOSSClawType so every open-source
-// MCP request carries the same stable routing tag. All other fields are
-// nil — the internal code interprets nil as "use standard open-source
-// behaviour".
+// MergeHeaders is the only hook that ships with behaviour: it supplies
+// DefaultOSSClawType so every open-source MCP request has a stable default.
+// DWS_AGENT_PRODUCT is sent through a separate observability Header and never
+// changes claw-type. All other fields are nil — the internal code interprets
+// nil as "use standard open-source behaviour".
 func defaultHooks() *Hooks {
 	return &Hooks{
 		Name: "open",
@@ -37,5 +37,76 @@ func defaultHooks() *Hooks {
 			base["claw-type"] = DefaultOSSClawType
 			return base
 		},
+		StaticServers:     openStaticServers,
+		SupplementServers: openSupplementServers,
+		VisibleProducts:   openVisibleProducts,
 	}
+}
+
+// openSupplementServers returns explicitly wired MCP endpoints owned by the
+// open CLI. They are callable by explicit server ID but are deliberately
+// excluded from VisibleProducts, so this hook never generates a top-level
+// product command. A public command using one of these endpoints must register
+// its Cobra tree explicitly via helpers.RegisterPublic.
+func openSupplementServers() []ServerInfo {
+	return []ServerInfo{
+		{
+			ID:       "mcp-meta",
+			Name:     "MCP 元服务",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/89833ea5debf30c260a07ffcb5127ffa3bf0c830cd76babadb293d9861485d44",
+		},
+		{
+			ID:       "mind",
+			Name:     "钉钉脑图",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/mind",
+		},
+		{
+			ID:       "whiteboard",
+			Name:     "钉钉白板",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/whiteboard",
+		},
+		{
+			ID:       "contract",
+			Name:     "智能合同",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/571e843ffa2f7546207fcae482d0d47a43bb7e5317bc717172998e1e00691710",
+		},
+		{
+			ID:       "drive-internal",
+			Name:     "钉钉知识管理-内部",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/e48ff8134b3e4ff6fe3a9cbae8b440869083f0213bd8879c91b080e703162e02",
+		},
+		{
+			ID:       "dingtalk-file",
+			Name:     "钉钉文件服务",
+			Endpoint: "https://mcp-gw.dingtalk.com/server/d48b09ddafc89bf921b777ff428f8fc88b14805ccdd9680e02b7be318e7ed4b4",
+		},
+	}
+}
+
+func openStaticServers() []ServerInfo {
+	raw := syncdata.StaticServers()
+	out := make([]ServerInfo, len(raw))
+	for i, s := range raw {
+		out[i] = ServerInfo{
+			ID:       s.ID,
+			Name:     s.Name,
+			Endpoint: s.Endpoint,
+			Prefixes: s.Prefixes,
+		}
+	}
+	return out
+}
+
+func openVisibleProducts() []string {
+	servers := openStaticServers()
+	out := make([]string, 0, len(servers))
+	seen := make(map[string]bool, len(servers))
+	for _, server := range servers {
+		if server.ID == "" || seen[server.ID] {
+			continue
+		}
+		seen[server.ID] = true
+		out = append(out, server.ID)
+	}
+	return out
 }
