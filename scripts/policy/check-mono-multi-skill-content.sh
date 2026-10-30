@@ -5,4 +5,4 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$ROOT"
 
-exec go test -count=1 ./test/unit -run 'TestMonoMultiSkillContent' 
+exec go test -count=1 ./test/unit -run 'TestMonoMultiSkillContent'

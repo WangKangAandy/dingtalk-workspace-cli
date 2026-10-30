@@ -1,7 +1,7 @@
 # Mono↔Multi Skill 内容质检规格
 
-> 对照基准：`skills/mono`（单 skill）。被测主体：`skills/multi`。  
-> 机读合同：`skills/content-qa/mono-multi-coverage.yaml`。  
+> 对照基准：`skills/mono`（单 skill）。被测主体：`skills/multi`。
+> 机读合同：`skills/content-qa/mono-multi-coverage.yaml`。
 > 执行：`make skill-mono-multi-content`（独立门禁；默认 `make policy` 按设计不包含该检查）。
 > 安装、升级与模式迁移见
 > [DWS 预制 Skill 安装、升级与模式迁移 RFC](rfc-skill-installation-and-upgrade.md)。

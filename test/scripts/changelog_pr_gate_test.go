@@ -106,6 +106,7 @@ func newChangelogGateRepo(t *testing.T) *changelogGateRepo {
 	for _, path := range []string{
 		"scripts/policy/check-changelog-pr.sh",
 		"scripts/policy/check-release-fragments.sh",
+		"scripts/policy/upstream-release-import.sh",
 		"scripts/policy/open-source-audit.sh",
 		"scripts/release/release-lib.sh",
 		"scripts/release/render-release-fragments.sh",

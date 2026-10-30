@@ -1,7 +1,7 @@
 # DWS Skill 内容框架合同
 
-> 本分支权威合同：`skills/mono` / `skills/multi` 的**内容组织**与 zip 内容树形状。  
-> 不做安装/升级行为约定。质检见 [skill-mono-multi-qa.md](skill-mono-multi-qa.md)。  
+> 本分支权威合同：`skills/mono` / `skills/multi` 的**内容组织**与 zip 内容树形状。
+> 不做安装/升级行为约定。质检见 [skill-mono-multi-qa.md](skill-mono-multi-qa.md)。
 > 安装、升级与模式迁移见
 > [DWS 预制 Skill 安装、升级与模式迁移 RFC](rfc-skill-installation-and-upgrade.md)。
 
@@ -93,6 +93,6 @@ mode 解析到唯一的实际内容树。
 
 ## 6. 变更流程
 
-1. 改 / 增内容 → 更新 `skills/content-qa/mono-multi-coverage.yaml`（coverage 或 omit）  
+1. 改 / 增内容 → 更新 `skills/content-qa/mono-multi-coverage.yaml`（coverage 或 omit）
 2. 跑 `make skill-mono-multi-content`（该独立门禁不包含在默认 `make policy` 中）
-3. 失败则修内容或更新 reviewed omit（disposition + 原因），**禁止**用安装默认值绕过  
+3. 失败则修内容或更新 reviewed omit（disposition + 原因），**禁止**用安装默认值绕过

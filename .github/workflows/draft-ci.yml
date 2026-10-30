@@ -95,7 +95,7 @@ jobs:
           DWS_PACKAGE_VERSION: 0.0.0-test
         run: >-
           go test -count=1 ./test/scripts
-          -run '^(TestDraftPRCIWorkflowContract|TestChangelogPRFastPathWorkflowContract)$'
+          -run '^(TestDraftPRCIWorkflowContract|TestChangelogPRFastPathWorkflowContract|TestPinnedUpstreamReleaseImport)$'
 
       - name: Record admission boundary
         run: |

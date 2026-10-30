@@ -12,6 +12,11 @@ usage() { printf '%s\n' 'usage: check-release-fragments.sh BASE HEAD' >&2; }
 [ "$#" -eq 2 ] || { usage; exit 2; }
 base="$(git -C "$ROOT" rev-parse --verify --quiet "$1^{commit}")" || { usage; exit 2; }
 head="$(git -C "$ROOT" rev-parse --verify --quiet "$2^{commit}")" || { usage; exit 2; }
+. "$ROOT/scripts/policy/upstream-release-import.sh"
+if is_verified_upstream_release_import "$ROOT" "$base" "$head"; then
+  printf '%s\n' 'release fragments: verified pinned upstream v1.0.66 import'
+  exit 0
+fi
 merge_base="$(git -C "$ROOT" merge-base "$base" "$head")"
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/dws-release-fragment-policy.XXXXXX")"
 cleanup() { rm -rf "$tmp_root"; }

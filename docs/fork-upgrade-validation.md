@@ -6,7 +6,8 @@ Environment: Windows amd64, Go 1.26.7, `CGO_ENABLED=0`,
 
 ## Passed
 
-- Baseline merge tree equals upstream except `docs/FORK_UPGRADE.md`.
+- Original baseline merge (`2e4649a6`) equals upstream except
+  `docs/FORK_UPGRADE.md`; later CI-only differences are documented there.
 - CLI build (`go build -o <temporary executable> ./cmd`). This is a stub build
   for optional CGO functionality, not validation of SafeChat.
 - Focused auth/app tests: expected-identity validation, both OAuth/device
@@ -49,3 +50,17 @@ defects. No unrelated production-code changes were made to silence them.
 Keep both PRs in draft until CI/platform checks and connector integration are
 reviewed. These results do not establish production readiness, Linux/CGO
 compatibility, or the success of an actual DingTalk authorization exchange.
+
+## PR #4 CI repair
+
+Commit `fca0eb9b` passed GitHub's Linux Draft Fast Gate, including build,
+vet, formatting, workflow checks, repository policy and the new pinned-import
+regression tests. The import exception preserves upstream release metadata
+exactly; it does not grant changelog-only fast-path admission.
+
+On Windows, the broader script package cannot compile because existing tests
+use Unix-only syscall types. Running the three relevant test files explicitly
+passed the new import cases, but existing tests failed on symlink privileges,
+executable-bit behavior and CRLF-sensitive workflow text assertions. The latter
+workflow checks passed on the GitHub Linux runner. This local run is not a
+full pass, and does not replace formal admission checks.

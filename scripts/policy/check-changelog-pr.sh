@@ -87,6 +87,15 @@ if [ "$MERGE_BASE" != "$BASE_COMMIT" ]; then
 fi
 require_regular_changelog "head" "$HEAD_COMMIT"
 
+. "$ROOT/scripts/policy/upstream-release-import.sh"
+if [ "$VALIDATION_MODE" = content-only ] &&
+  is_verified_upstream_release_import "$ROOT" "$BASE_COMMIT" "$HEAD_COMMIT"; then
+	git diff --no-ext-diff --check "$BASE_COMMIT" "$HEAD_COMMIT" -- CHANGELOG.md
+	"$ROOT/scripts/policy/open-source-audit.sh"
+	printf '%s\n' 'CHANGELOG: verified pinned upstream v1.0.66 import'
+	exit 0
+fi
+
 git diff --no-ext-diff --find-renames --name-status \
 	"$MERGE_BASE" "$HEAD_COMMIT" >"$TMP_ROOT/name-status"
 case "$VALIDATION_MODE" in
