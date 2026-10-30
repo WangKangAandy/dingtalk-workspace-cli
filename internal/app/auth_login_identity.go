@@ -15,6 +15,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"unicode"
 
@@ -29,6 +30,18 @@ import (
 type authExpectedIdentity struct {
 	corpID string
 	userID string
+}
+
+// Preserve only the new guard's errors. All other login failures, including
+// every unguarded login, retain the upstream error mapping and retry guidance.
+func (expected authExpectedIdentity) flowError(prefix string, err error) error {
+	var classified *apperrors.Error
+	if expected.corpID != "" && errors.As(err, &classified) &&
+		classified.Category == apperrors.CategoryAuth &&
+		(classified.Reason == "identity_mismatch" || classified.Reason == "identity_unverified") {
+		return err
+	}
+	return authLoginFlowError(prefix, err)
 }
 
 func resolveExpectedAuthLoginIdentity(cmd *cobra.Command, token, profile string) (authExpectedIdentity, error) {

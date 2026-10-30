@@ -21,6 +21,27 @@ upstream history into the existing fork history. It does not reset `main`.
 
 ## Requirements still owned by the integration
 
+The fork's allowed runtime delta is only the optional pre-save expected-login
+identity guard. Profile selection/storage, token refresh/cache, default login,
+error rendering, product APIs and skill installation remain upstream behavior.
+CI import checks, whitespace fixes, tests and maintainer documentation support
+the upgrade; they do not introduce additional runtime features.
+
+| Required behavior | Implementation owner and boundary |
+|---|---|
+| Trusted message sender selects an exact account | Connector derives `corpId:userId`; DWS uses upstream `--profile` |
+| Missing authorization, link in current conversation, first login | Agent/connector coordinates the flow; DWS login uses `--expect-identity`, without `--profile` |
+| Actual authorizer matches the requester | This fork's optional guard rejects mismatched or unverified identities before saving |
+| Robot and user OAuth credentials stay separate | Connector configuration and child-process environment |
+| Downloads use `media/inbound` | Deployment-managed Agent rules and explicit output paths |
+| Skill installation | Upstream setup; no custom single-directory installer unless separately required |
+
+An integration that injects `--profile` into every DWS command must distinguish
+business calls from `auth login`. For login, inject the trusted
+`--expect-identity` instead: a new user's Profile does not exist yet, and the
+two flags are deliberately incompatible. The DWS PRs alone do not implement
+this command routing or conversation delivery.
+
 The connector owns the trusted sender-to-profile mapping, authorization-link
 delivery to the originating conversation, login concurrency and expiry, and
 matching the completed authorization to that sender. Profile selection alone

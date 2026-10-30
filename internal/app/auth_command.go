@@ -216,7 +216,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				}
 				tokenData, err = authDeviceLogin(provider, loginCtx)
 				if err != nil {
-					return authLoginFlowError("device authorization failed", err)
+					return cfg.ExpectedIdentity.flowError("device authorization failed", err)
 				}
 			default:
 				loginCtx, cancel := context.WithTimeout(cmd.Context(), config.OAuthFlowTimeout)
@@ -238,7 +238,7 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 				configureOAuthProviderCompatibility(provider, configDir)
 				tokenData, err = authOAuthLogin(provider, loginCtx, authLoginForcesAuthorization(cfg))
 				if err != nil {
-					return authLoginFlowError("dingtalk login failed", err)
+					return cfg.ExpectedIdentity.flowError("dingtalk login failed", err)
 				}
 			}
 
@@ -354,9 +354,6 @@ func newAuthLoginCommand(patCaller edition.ToolCaller) *cobra.Command {
 }
 
 func authLoginFlowError(prefix string, err error) error {
-	if apperrors.DeclaresClassification(err) {
-		return err
-	}
 	if guidance, ok := authpkg.LoginRetryGuidance(err); ok {
 		return apperrors.NewAuth(guidance)
 	}

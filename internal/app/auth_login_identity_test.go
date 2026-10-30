@@ -138,6 +138,40 @@ func TestCrossPlatformCoverageExpectedLoginIdentityOAuthAndDevice(t *testing.T) 
 	}
 }
 
+func TestCrossPlatformCoverageExpectedLoginIdentityErrorScope(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, reason := range []string{"identity_mismatch", "identity_unverified", "other"} {
+			for _, category := range []string{"auth", "api"} {
+				t.Run(fmt.Sprintf("enabled=%t/%s/%s", enabled, category, reason), func(t *testing.T) {
+					expected := authExpectedIdentity{}
+					if enabled {
+						expected = authExpectedIdentity{corpID: "corp", userID: "user"}
+					}
+					classified := apperrors.NewAuth("failure", apperrors.WithReason(reason))
+					if category == "api" {
+						classified = apperrors.NewAPI("failure", apperrors.WithReason(reason))
+					}
+					wrapped := fmt.Errorf("provider: %w", classified)
+					got := expected.flowError("login failed", wrapped)
+					if enabled && category == "auth" && reason != "other" {
+						if got != wrapped {
+							t.Fatalf("guard error not preserved: %v", got)
+						}
+						return
+					}
+					want := authLoginFlowError("login failed", wrapped)
+					var actual, baseline *apperrors.Error
+					if !errors.As(got, &actual) || !errors.As(want, &baseline) ||
+						actual.Category != baseline.Category || actual.Reason != baseline.Reason ||
+						actual.Error() != baseline.Error() || actual.ExitCode() != baseline.ExitCode() {
+						t.Fatalf("non-guard error differs from upstream: got=%v want=%v", got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCrossPlatformCoverageExpectedLoginIdentityDoesNotTrustHistory(t *testing.T) {
 	t.Setenv(keychain.TestNamespaceEnv, t.TempDir())
 	configDir := setupAuthLogoutProfiles(t, authLogoutTestToken("ding_corp"))

@@ -43,8 +43,9 @@ current profile in a shared bot. Permission/scope errors are not login errors.
 
 `auth login` remains an existing reviewed CLI-management Schema exclusion;
 this change does not introduce an Agent business command or hand-written JSON
-envelope. It preserves classified provider errors so the standard renderer can
-publish the reason. Error messages do not include the credential or actual
+envelope. It preserves only the two guard-specific errors during a guarded
+login so the standard renderer can publish the reason. All other login errors
+retain upstream classification and retry guidance. Error messages do not include the credential or actual
 other user's identity. The old `IDENTITY_*` protocol and exit 5 are not restored.
 
 Tests exercise malformed options, both login-flow hooks, first login, wrong
