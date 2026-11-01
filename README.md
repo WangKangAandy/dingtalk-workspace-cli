@@ -1,3 +1,11 @@
+> [!WARNING]
+> **This repository is archived and no longer maintained.**
+> **本仓库已归档、不再维护。**
+>
+> Please use the official project instead:
+> 请改用官方仓库：
+> https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli
+
 <h1 align="center">DingTalk Workspace CLI (dws)</h1>
 
 <p align="center"><code>dws</code> — DingTalk Workspace on the command line, built for humans and AI agents.</p>
